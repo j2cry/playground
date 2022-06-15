@@ -4,6 +4,10 @@ import pandas as pd
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_squared_error
 from tqdm import tqdm
+from collections import namedtuple
+
+
+Step = namedtuple('Step', 'callable,parameters')
 
 
 path = pathlib.Path().joinpath('data')
@@ -29,6 +33,22 @@ def save_submission(predicted):
     sub['value'] = predict
     sub.to_csv('submission.csv', index=False)
     return sub.head()
+
+
+class ImputerHelper():
+    def __init__(self, *steps):
+        self.steps = steps
+
+    def run(self, data, inherit=True):
+        """
+        :params data - original dataset
+        :params inherit - put the previous result to the next step input
+        """
+        predicted = data.copy()
+        for step in map(Step, *zip(*self.steps)):
+            step_result = step.callable(data if not inherit else predicted, step.parameters)
+            predicted.fillna(step_result, inplace=True)
+        return predicted
 
 
 def ml_impute(df, pipe):
