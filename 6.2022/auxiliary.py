@@ -18,10 +18,12 @@ data_path = path.joinpath('data.csv')
 data = pd.read_csv(data_path, index_col='row_id')
 # subset split
 n_sub = 4
-subset = [data.columns, ]
+subset = [data, ]
+subcol = [data.columns, ]
 for n in range(n_sub):
-    columns = data.columns[data.columns.str.startswith(f'F_{n + 1}')]
-    subset.append(columns)
+    columns = data.columns[data.columns.str.startswith(f'F_{n + 1}')].tolist()
+    subset.append(data[columns])
+    subcol.append(columns)    
 
 
 def save_submission(predicted):
@@ -71,22 +73,33 @@ def calc_score(df, pred):
     return np.mean(metrics)
 
 
-def ml_impute(df, estimator):
-    """ Impute data with one-per-column estimators """
+def ml_impute(df, estimator, *, max_fill_nan_count=np.inf, max_train_nan_count=np.inf):
+    """ Impute data with one-per-column estimators
+    :param df - original dataset
+    :param estimator - model to be fit
+    :param max_fill_nan_count - max allowed number of NaN in row to predict value in it (before train/test split)
+    :param max_train_nan_count - flag to use data containing NaN in train. If True, NaN will be filled in with mean.
+    """
+    assert max_fill_nan_count >= 1, "`max_fill_nan_count` < 1 doesn't make sense. No value will be predicted."
+    assert max_train_nan_count >= 0, "`max_train_nan_count` < 0 doesn't make sense. No data left for training."
+
     pred = df.copy()
     metrics = []
-    nan_cols = df.columns[df.isna().any()]      # get columns with nans
+    nan_cols = df.columns[df.isna().any()]      # select columns with nans
+    fill_nan_count = df.isna().sum(axis=1) <= max_fill_nan_count
+    train_nan_count = df.isna().any(axis=1) <= max_train_nan_count
+
     for col in tqdm(nan_cols):
-        nan_rows = df[col].isna()   # select rows that are NaN in this columns
+        target_mask = df[col].isna()   # select rows that are NaN in this columns
         # train/test split
-        X_train = df[~nan_rows].drop(col, axis=1)       # fit on WHOLE data TODO: not_na_train parameter
-        y_train = df.loc[~nan_rows, col]
-        X_test = df[nan_rows].drop(col, axis=1)
+        X_train = df[~target_mask & train_nan_count].drop(col, axis=1)
+        y_train = df.loc[~target_mask & train_nan_count, col]
+        X_test = df[target_mask & fill_nan_count].drop(col, axis=1)
         
         # fit/predict
         estimator.fit(X_train, y_train)
         train_pred = estimator.predict(X_train)
-        pred.loc[nan_rows, col] = estimator.predict(X_test)
+        pred.loc[target_mask & fill_nan_count, col] = estimator.predict(X_test)
         # score pipeline
         metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))    # RMSE
     print(f'\nML Imputer avg. score: {np.mean(metrics)}')
@@ -114,3 +127,5 @@ def groupstat(df, *, gcol, func='mean'):
     pred = df.fillna(stats)
     print(f'GroupStat avg. score: {calc_score(df, stats)}')
     return pred
+
+
