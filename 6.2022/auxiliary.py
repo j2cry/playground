@@ -5,28 +5,28 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_squared_error
 from tqdm import tqdm
 from collections import namedtuple
+from typing import Mapping, Iterable
 
 
-Step = namedtuple('Step', 'callable,parameters')
+Step = namedtuple('Step', 'callable,columns,parameters')
 
 
 path = pathlib.Path().joinpath('data')
 data_path = path.joinpath('data.csv')
-sub_path = path.joinpath('sample_submission.csv')
 
 # read data
 data = pd.read_csv(data_path, index_col='row_id')
-
 # subset split
 n_sub = 4
-subset = [None, ]       # this is for a more familiar numbering
+subset = [data.columns, ]
 for n in range(n_sub):
-    sub_cols = data.columns[data.columns.str.startswith(f'F_{n + 1}')]
-    subset.append(data[sub_cols])
+    columns = data.columns[data.columns.str.startswith(f'F_{n + 1}')]
+    subset.append(columns)
 
 
 def save_submission(predicted):
     print(f'Still contain NaN: {predicted.isna().any().any()}')
+    sub_path = path.joinpath('sample_submission.csv')
     # collect predictions
     sub = pd.read_csv(sub_path)
     predict = sub['row-col'].str.split('-').apply(lambda bundle: predicted.loc[int(bundle[0]), bundle[1]])
@@ -35,7 +35,7 @@ def save_submission(predicted):
     return sub.head()
 
 
-class ImputerHelper():
+class ImputeHelper():
     def __init__(self, *steps):
         self.steps = steps
 
@@ -46,69 +46,71 @@ class ImputerHelper():
         """
         predicted = data.copy()
         for step in map(Step, *zip(*self.steps)):
-            step_result = step.callable(data if not inherit else predicted, step.parameters)
-            predicted.fillna(step_result, inplace=True)
+            columns = step.columns if step.columns != 'all' else data.columns
+            df = data[columns] if not inherit else predicted[columns]
+            # call step function
+            if isinstance(step.parameters, Mapping):
+                step_result = step.callable(df, **step.parameters)
+            elif isinstance(step.parameters, Iterable) and not isinstance(step.parameters, str):
+                step_result = step.callable(df, *step.parameters)
+            else:
+                step_result = step.callable(df, step.parameters)
+            predicted.fillna(step_result[columns], inplace=True)
         return predicted
 
 
-def ml_impute(df, pipe):
-    """
-    :param pipe - estimator or transformer pipeline
-    """
-    imp = df.copy()
-    metrics = []
-    # get columns with nans
-    nan_cols = df.columns[df.isna().any()]
-    is_estimator = hasattr(pipe, 'predict')
-    if not is_estimator:
-        pipe.fit(df[nan_cols])    # fit if pipe is transformer
-        # predict
-        stats = pd.DataFrame([pipe[-1].statistics_ if isinstance(pipe, Pipeline) else pipe.statistics_] * df.shape[0], index=df.index, columns=df.columns)
-
-    for col in tqdm(nan_cols):
-        nan_rows = df[col].isna()   # select rows that are NaN in this columns
-        y_train = df.loc[~nan_rows, col]
-
-        # fit if pipe is estimator
-        if is_estimator:
-            # train/test split
-            X_train = df[~nan_rows].drop(col, axis=1)
-            X_test = df[nan_rows].drop(col, axis=1)
-            pipe.fit(X_train, y_train)
-            # predict
-            train_pred = pipe.predict(X_train)
-            imp.loc[nan_rows, col] = pipe.predict(X_test)
-        else:
-            # predict if pipe is transformer
-            train_pred = stats.loc[~nan_rows, col]
-            imp.loc[nan_rows, col] = stats.loc[nan_rows, col].values
-          
-        # score pipeline
-        score = np.sqrt(mean_squared_error(y_train, train_pred))    # RMSE
-    metrics.append(score)
-    print(f'\n{np.mean(metrics)}')
-    return imp
-
-
-def groupstat(df, *, gcol, func='mean'):
-    stats = df.groupby(gcol).transform(func)
-    if stats.isna().any().any():
-        stats.fillna(stats.agg(func), inplace=True)
-        print(f'Stats contain NaNs! Filled with {func}')
-    imp = df.fillna(stats)
-    # if imp.isna().any().any():
-    #     imp.fillna(imp.agg(func), inplace=True)
-    #     print('Data still contain NaNs! Select another group columns')
-
+def calc_score(df, pred):
     # compute score
     metrics = []
     nan_cols = df.columns[df.isna().any()]
     for col in tqdm(nan_cols):
         nan_rows = df[col].isna()   # select rows that are NaN in this columns
         y_train = df.loc[~nan_rows, col]
-        train_pred = stats.loc[~nan_rows, col]
-        score = np.sqrt(mean_squared_error(y_train, train_pred))    # RMSE
+        train_pred = pred.loc[~nan_rows, col]
+        metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))
+    return np.mean(metrics)
 
-    metrics.append(score)
-    print(f'\n{np.mean(metrics)}')
-    return imp
+
+def ml_impute(df, estimator):
+    """ Impute data with one-per-column estimators """
+    pred = df.copy()
+    metrics = []
+    nan_cols = df.columns[df.isna().any()]      # get columns with nans
+    for col in tqdm(nan_cols):
+        nan_rows = df[col].isna()   # select rows that are NaN in this columns
+        # train/test split
+        X_train = df[~nan_rows].drop(col, axis=1)       # fit on WHOLE data TODO: not_na_train parameter
+        y_train = df.loc[~nan_rows, col]
+        X_test = df[nan_rows].drop(col, axis=1)
+        
+        # fit/predict
+        estimator.fit(X_train, y_train)
+        train_pred = estimator.predict(X_train)
+        pred.loc[nan_rows, col] = estimator.predict(X_test)
+        # score pipeline
+        metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))    # RMSE
+    print(f'\nML Imputer avg. score: {np.mean(metrics)}')
+    return pred
+
+
+def simplestat(df, imputer):
+    """ Impute data with SimpleImputer """
+    nan_cols = df.columns[df.isna().any()]      # get columns with nans
+    # fit/predict
+    imputer.fit(df[nan_cols])
+    values = np.full(df.shape, imputer[-1].statistics_ if isinstance(imputer, Pipeline) else imputer.statistics_)
+    stats = pd.DataFrame(values, index=df.index, columns=df.columns)    
+    pred = df.fillna(stats)
+    print(f'SimpleStat avg. score: {calc_score(df, stats)}')
+    return pred
+
+
+def groupstat(df, *, gcol, func='mean'):
+    """ Impute data with grouped statistics """
+    stats = df.groupby(gcol).transform(func)
+    if stats.isna().any().any():
+        stats.fillna(stats.agg(func), inplace=True)
+        print(f'Stats contain NaNs! Data may not be filled in completely!')
+    pred = df.fillna(stats)
+    print(f'GroupStat avg. score: {calc_score(df, stats)}')
+    return pred
