@@ -6,7 +6,9 @@ from sklearn.metrics import mean_squared_error
 from tqdm import tqdm
 from collections import namedtuple
 from typing import Mapping, Iterable
-
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.utils import parallel_backend
+from joblib import Parallel, delayed
 
 Step = namedtuple('Step', 'callable,columns,parameters')
 
@@ -61,6 +63,50 @@ class ImputeHelper():
         return predicted
 
 
+class CosineSimilarity:
+    def __init__(self, df):
+        self.use_cols = df.columns[~df.isna().any()]
+        self.nan_rows = df.isna().any(axis=1)
+        self.df = df
+    
+    def _process_chunk(self, chunk, k, threshold):
+        cosine = cosine_similarity(chunk, self.df[self.use_cols])
+        if threshold is not None:       # collect by threshold
+            mask = cosine > threshold       # apply threshold
+            np.fill_diagonal(mask, False)   # exclude ownes
+            # return list(map(lambda m: self.df[m].mean().values, mask))
+            return np.apply_along_axis(lambda m: self.df[m].mean(), 1, mask)
+        elif k is not None:     # collect by k nearest
+            # return list(map(lambda c: self.df.iloc[np.argsort(c)[::-1][1:]].head(k).mean().values, cosine))
+            return np.apply_along_axis(lambda c: self.df.iloc[np.argsort(c)[::-1][1:]].head(k).mean(), 1, cosine)
+
+    def calculate(self, *, k=None, threshold=None, chunksize=100, backend='loky'):
+        assert bool(k) ^ bool(threshold), 'Only one parameter must be specified: either `k` or `threshold`.'
+
+        df_size = self.df[self.nan_rows].index.size
+        chunk_count = df_size // chunksize + (1 if df_size % chunksize else 0)
+        print(f'Chunks: {chunk_count}')
+        arr = []
+        # for start in tqdm(range(0, df_size, chunksize), total=chunk_count):
+        #     arr.extend(self._process_chunk(self.df.loc[self.nan_rows, self.use_cols].iloc[start:start + chunksize], k, threshold))
+        if backend is not None:
+            with parallel_backend(backend):
+                result = (Parallel(n_jobs=-1)(
+                    delayed(self._process_chunk)(self.df.loc[self.nan_rows, self.use_cols].iloc[start:start + chunksize], k, threshold) 
+                        for start in tqdm(range(0, df_size, chunksize), total=chunk_count)
+                ))
+        else:
+            result = [self._process_chunk(self.df.loc[self.nan_rows, self.use_cols].iloc[start:start + chunksize], k, threshold)
+                        for start in tqdm(range(0, df_size, chunksize), total=chunk_count)]
+        # parse result
+        for part in result:
+            arr.extend(part)
+        stats = pd.DataFrame(arr, index=self.df[self.nan_rows].index)
+        if stats.isna().any().any():
+            print('Some values are NaN. Try decrease threshold.')
+        return stats
+
+
 def calc_score(df, pred):
     # compute score
     metrics = []
@@ -111,8 +157,8 @@ def simplestat(df, imputer):
     nan_cols = df.columns[df.isna().any()]      # get columns with nans
     # fit/predict
     imputer.fit(df[nan_cols])
-    values = np.full(df.shape, imputer[-1].statistics_ if isinstance(imputer, Pipeline) else imputer.statistics_)
-    stats = pd.DataFrame(values, index=df.index, columns=df.columns)    
+    values = np.full(df[nan_cols].shape, imputer[-1].statistics_ if isinstance(imputer, Pipeline) else imputer.statistics_)
+    stats = pd.DataFrame(values, index=df.index, columns=df[nan_cols].columns)
     pred = df.fillna(stats)
     print(f'SimpleStat avg. score: {calc_score(df, stats)}')
     return pred
@@ -129,3 +175,9 @@ def groupstat(df, *, gcol, func='mean'):
     return pred
 
 
+def cosine_stats(df, *, k=None, threshold=None, backend='loky', chunksize=100):
+    csim = CosineSimilarity(df)
+    stats = csim.calculate(k=k, threshold=threshold, backend=backend, chunksize=chunksize)
+    pred = df.fillna(stats)
+    print(f'SimpleStat avg. score: {calc_score(df, stats)}')
+    return pred
