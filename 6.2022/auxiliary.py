@@ -1,16 +1,18 @@
+import os
 import pathlib
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
+from functools import wraps
+
+from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_squared_error
-from tqdm import tqdm
-from collections import namedtuple
 from typing import Mapping, Iterable
+
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.utils import parallel_backend
 from joblib import Parallel, delayed
-
-Step = namedtuple('Step', 'callable,columns,parameters')
 
 
 path = pathlib.Path().joinpath('data')
@@ -39,6 +41,43 @@ def save_submission(predicted):
     return sub.head()
 
 
+def deprecated(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        print(f"Using `{func.__name__}()` is deprecated! It may take a VERY long time on large data, work unstable or don't work at all.")
+        return func(*args, **kwargs)
+    return wrapper
+
+# =============================== Impute Helper Definition ===============================
+class Step:
+    def __init__(self, func, columns, **kwargs):
+        """
+        :param func - step function, must have signature like func(train, test, **params)
+        :param columns - columns passed to function
+        :keyword max_fill_nan_count - max allowed number of NaN in row to predict value in it
+        :keywird max_train_nan_count - max allowed number of NaN in row to use it in train. NaN will be filled in with mean
+        """
+
+        assert func is not callable, "`func` parameter must be callable"
+        self.func = func
+        self.columns = columns
+        # parse parameters
+        self.max_fill_nan_count = kwargs.pop('max_fill_nan_count', np.inf)
+        assert self.max_fill_nan_count >= 1, "`max_fill_nan_count` < 1 doesn't make sense. No value will be predicted."
+        self.max_train_nan_count = kwargs.pop('max_train_nan_count', np.inf)
+        assert self.max_train_nan_count >= 0, "`max_train_nan_count` < 0 doesn't make sense. No data left for training."
+        self.params = kwargs
+
+    def call(self, df):
+        # train/test split
+        self.columns = self.columns if self.columns != 'all' else df.columns
+        fill_nan_count = df.isna().sum(axis=1) <= self.max_fill_nan_count
+        train_nan_count = df.isna().sum(axis=1) <= self.max_train_nan_count        
+        train = df.loc[train_nan_count, self.columns]
+        test = df.loc[fill_nan_count, self.columns]
+        return self.func(train, test, **self.params)
+
+
 class ImputeHelper():
     def __init__(self, *steps):
         self.steps = steps
@@ -49,65 +88,14 @@ class ImputeHelper():
         :params inherit - put the previous result to the next step input
         """
         predicted = data.copy()
-        for step in map(Step, *zip(*self.steps)):
-            columns = step.columns if step.columns != 'all' else data.columns
-            df = data[columns] if not inherit else predicted[columns]
+        for step in self.steps:            
             # call step function
-            if isinstance(step.parameters, Mapping):
-                step_result = step.callable(df, **step.parameters)
-            elif isinstance(step.parameters, Iterable) and not isinstance(step.parameters, str):
-                step_result = step.callable(df, *step.parameters)
-            else:
-                step_result = step.callable(df, step.parameters)
-            predicted.fillna(step_result[columns], inplace=True)
+            step_result = step.call(predicted if inherit else data)
+            predicted.fillna(step_result, inplace=True)
         return predicted
 
 
-class CosineSimilarity:
-    def __init__(self, df):
-        self.use_cols = df.columns[~df.isna().any()]
-        self.nan_rows = df.isna().any(axis=1)
-        self.df = df
-    
-    def _process_chunk(self, chunk, k, threshold):
-        cosine = cosine_similarity(chunk, self.df[self.use_cols])
-        if threshold is not None:       # collect by threshold
-            mask = cosine > threshold       # apply threshold
-            np.fill_diagonal(mask, False)   # exclude ownes
-            # return list(map(lambda m: self.df[m].mean().values, mask))
-            return np.apply_along_axis(lambda m: self.df[m].mean(), 1, mask)
-        elif k is not None:     # collect by k nearest
-            # return list(map(lambda c: self.df.iloc[np.argsort(c)[::-1][1:]].head(k).mean().values, cosine))
-            return np.apply_along_axis(lambda c: self.df.iloc[np.argsort(c)[::-1][1:]].head(k).mean(), 1, cosine)
-
-    def calculate(self, *, k=None, threshold=None, chunksize=100, backend='loky'):
-        assert bool(k) ^ bool(threshold), 'Only one parameter must be specified: either `k` or `threshold`.'
-
-        df_size = self.df[self.nan_rows].index.size
-        chunk_count = df_size // chunksize + (1 if df_size % chunksize else 0)
-        print(f'Chunks: {chunk_count}')
-        arr = []
-        # for start in tqdm(range(0, df_size, chunksize), total=chunk_count):
-        #     arr.extend(self._process_chunk(self.df.loc[self.nan_rows, self.use_cols].iloc[start:start + chunksize], k, threshold))
-        if backend is not None:
-            with parallel_backend(backend):
-                result = (Parallel(n_jobs=-1)(
-                    delayed(self._process_chunk)(self.df.loc[self.nan_rows, self.use_cols].iloc[start:start + chunksize], k, threshold) 
-                        for start in tqdm(range(0, df_size, chunksize), total=chunk_count)
-                ))
-        else:
-            result = [self._process_chunk(self.df.loc[self.nan_rows, self.use_cols].iloc[start:start + chunksize], k, threshold)
-                        for start in tqdm(range(0, df_size, chunksize), total=chunk_count)]
-        # parse result
-        for part in result:
-            arr.extend(part)
-        stats = pd.DataFrame(arr, index=self.df[self.nan_rows].index)
-        if stats.isna().any().any():
-            print('Some values are NaN. Try decrease threshold.')
-        return stats
-
-
-def calc_score(df, pred):
+def calc_train_score(df, pred):
     # compute score
     metrics = []
     nan_cols = df.columns[df.isna().any()]
@@ -119,65 +107,103 @@ def calc_score(df, pred):
     return np.mean(metrics)
 
 
-def ml_impute(df, estimator, *, max_fill_nan_count=np.inf, max_train_nan_count=np.inf):
-    """ Impute data with one-per-column estimators
-    :param df - original dataset
-    :param estimator - model to be fit
-    :param max_fill_nan_count - max allowed number of NaN in row to predict value in it (before train/test split)
-    :param max_train_nan_count - flag to use data containing NaN in train. If True, NaN will be filled in with mean.
-    """
-    assert max_fill_nan_count >= 1, "`max_fill_nan_count` < 1 doesn't make sense. No value will be predicted."
-    assert max_train_nan_count >= 0, "`max_train_nan_count` < 0 doesn't make sense. No data left for training."
+# =============================== Imputer step functions ===============================
+def simplestat(train, test, imputer=SimpleImputer()):
+    """ Impute data with SimpleImputer """
+    imputer.fit(train)
+    check = pd.DataFrame(imputer.transform(train), index=train.index, columns=train.columns)
+    print(f'Simple imputer avg. score: {calc_train_score(train, check)}')
+    values = pd.DataFrame(imputer.transform(test), index=test.index, columns=test.columns)
+    pred = test.fillna(values)
+    return 
 
-    pred = df.copy()
+
+def groupstat(train, test, *, gcol, func='mean'):
+    """ Impute data with grouped statistics """
+    stats = train.groupby(gcol).transform(func)
+    if stats.isna().any().any():
+        print(f'Stats contain NaN! Data may not filled in completely!')
+    print(f'Groupstat imputer avg. score: {calc_train_score(train.drop(gcol, axis=1), stats)}')
+    return test.fillna(stats)
+
+
+def predictor(train, test, *, estimator):
+    """ Impute data with one-per-column estimators """
+    pred = test.copy()
     metrics = []
-    nan_cols = df.columns[df.isna().any()]      # select columns with nans
-    fill_nan_count = df.isna().sum(axis=1) <= max_fill_nan_count
-    train_nan_count = df.isna().any(axis=1) <= max_train_nan_count
+    nan_cols = test.columns[test.isna().any()]      # select columns to be filled in
 
     for col in tqdm(nan_cols):
-        target_mask = df[col].isna()   # select rows that are NaN in this columns
+        nan_target = train[col].isna()      # exclude rows without target from train
+        target_mask = test[col].isna()      # select rows that are NaN in this columns
         # train/test split
-        X_train = df[~target_mask & train_nan_count].drop(col, axis=1)
-        y_train = df.loc[~target_mask & train_nan_count, col]
-        X_test = df[target_mask & fill_nan_count].drop(col, axis=1)
+        X_train = train[~nan_target].drop(col, axis=1)
+        y_train = train.loc[~nan_target, col]
+        X_test = test[target_mask].drop(col, axis=1)
         
         # fit/predict
         estimator.fit(X_train, y_train)
         train_pred = estimator.predict(X_train)
-        pred.loc[target_mask & fill_nan_count, col] = estimator.predict(X_test)
+        pred.loc[target_mask, col] = estimator.predict(X_test)
         # score pipeline
         metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))    # RMSE
     print(f'\nML Imputer avg. score: {np.mean(metrics)}')
     return pred
 
 
-def simplestat(df, imputer):
-    """ Impute data with SimpleImputer """
-    nan_cols = df.columns[df.isna().any()]      # get columns with nans
-    # fit/predict
-    imputer.fit(df[nan_cols])
-    values = np.full(df[nan_cols].shape, imputer[-1].statistics_ if isinstance(imputer, Pipeline) else imputer.statistics_)
-    stats = pd.DataFrame(values, index=df.index, columns=df[nan_cols].columns)
-    pred = df.fillna(stats)
-    print(f'SimpleStat avg. score: {calc_score(df, stats)}')
-    return pred
 
 
-def groupstat(df, *, gcol, func='mean'):
-    """ Impute data with grouped statistics """
-    stats = df.groupby(gcol).transform(func)
-    if stats.isna().any().any():
-        stats.fillna(stats.agg(func), inplace=True)
-        print(f'Stats contain NaNs! Data may not be filled in completely!')
-    pred = df.fillna(stats)
-    print(f'GroupStat avg. score: {calc_score(df, stats)}')
-    return pred
 
 
-def cosine_stats(df, *, k=None, threshold=None, backend='loky', chunksize=100):
-    csim = CosineSimilarity(df)
+# this takes a VERY long time
+class CosineSimilarity:
+    def __init__(self, train, test):
+        nan_rows = test.isna().any(axis=1)
+        self.use_cols = train.columns[~train.isna().any() & ~test.isna().any()]
+        self.train = train
+        self.test = test[nan_rows]
+    
+    def _process_chunk(self, chunk, k, threshold):
+        cosine = cosine_similarity(chunk, self.train[self.use_cols])
+        if threshold is not None:           # collect by threshold
+            mask = cosine > threshold       # apply threshold
+            np.fill_diagonal(mask, False)   # exclude ownes
+            # return list(map(lambda m: self.df[m].mean().values, mask))
+            return np.apply_along_axis(lambda m: self.train[m].mean(), 1, mask)
+        elif k is not None:     # collect by k nearest
+            # return list(map(lambda c: self.df.iloc[np.argsort(c)[::-1][1:]].head(k).mean().values, cosine))
+            return np.apply_along_axis(lambda c: self.train.iloc[np.argsort(c)[::-1][1:]].head(k).mean(), 1, cosine)
+
+    def calculate(self, *, k=None, threshold=None, backend=None, chunksize=50):
+        assert bool(k) ^ bool(threshold), 'Only one parameter must be specified: either `k` or `threshold`.'
+
+        test_size = self.test.index.size
+        chunk_count = test_size // chunksize + (1 if test_size % chunksize else 0)
+        print(f'{test_size} rows in {chunk_count} chunks')
+        arr = []
+        if backend is not None:
+            with parallel_backend(backend):
+                result = (Parallel(n_jobs=-1)(
+                    delayed(self._process_chunk)(self.test[self.use_cols].iloc[start:start + chunksize], k, threshold) 
+                        for start in tqdm(range(0, test_size, chunksize), total=chunk_count)
+                ))
+        else:
+            result = [self._process_chunk(self.test[self.use_cols].iloc[start:start + chunksize], k, threshold)
+                        for start in tqdm(range(0, test_size, chunksize), total=chunk_count)]
+        # parse result
+        for part in result:
+            arr.extend(part)
+        stats = pd.DataFrame(arr, index=self.test.index, columns=self.test.columns)
+        if stats.isna().any().any():
+            print('Some values are NaN. Try decrease threshold.')
+        return stats
+
+
+@deprecated
+def cosine_stats(train, test, *, k=None, threshold=None, backend=None, chunksize=50):
+    if backend is not None:
+        os.environ['MKL_NUM_THREADS'] = '1'
+    csim = CosineSimilarity(train, test)
     stats = csim.calculate(k=k, threshold=threshold, backend=backend, chunksize=chunksize)
-    pred = df.fillna(stats)
-    print(f'SimpleStat avg. score: {calc_score(df, stats)}')
+    pred = test.fillna(stats)
     return pred
