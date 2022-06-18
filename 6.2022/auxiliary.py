@@ -218,7 +218,36 @@ def mean_matching(train, test=None, *, N, init, backend=None):
 
 
 # ==================== Multiple imputation of chained equations ===================
-# not implemented yet
+def mice(df, test=None, *, estimator, epochs=10, seed=None):
+    """ Multiple imputation by chained equations
+    :param df - original dataset
+    :param estimator - estimetor used for imputation
+    :param epochs - number of iterations
+    :param seed - random seed to achieve repeatability
+    """
+    assert test is None, "This MICE implementation requires the autosplit parameter to be set to False"
+    
+    # initiate
+    data = df.fillna(df.mean())
+    nans = df.isna()
+    np.random.seed(seed)
+
+    for n in range(epochs):
+        epoch_metrics = []
+        for col in tqdm(data.columns[nans.any()], desc=f'Epoch {n + 1} / {epochs}'):
+            # train/test split
+            X_train = data[~nans[col]].drop(col, axis=1)
+            y_train = data.loc[~nans[col], col]
+            X_test = data[nans[col]].drop(col, axis=1)
+            # fit/predict        
+            estimator.set_params(random_state=np.random.randint(2**32))
+            estimator.fit(X_train, y_train)
+            train_pred = estimator.predict(X_train)
+            epoch_metrics.append(mean_squared_error(y_train, train_pred))
+            # update mising values
+            data.loc[nans[col], col] = estimator.predict(X_test)
+        print(f'Epoch {n + 1} avg. score: {np.mean(epoch_metrics)}')
+    return data
 
 
 # =============================== Cosine similarity ===============================
