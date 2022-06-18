@@ -224,24 +224,26 @@ def mean_matching(train, test=None, *, N, init, backend=None):
 # =============================== Cosine similarity ===============================
 # this takes a VERY long time
 class CosineSimilarity:
-    def __init__(self, train, test):
+    def __init__(self, train, test, *, seed=None):
         nan_rows = test.isna().any(axis=1)
         self.use_cols = train.columns[~train.isna().any() & ~test.isna().any()]
         self.train = train
         self.test = test[nan_rows]
+        np.random.seed(seed)
     
-    def _process_chunk(self, chunk, k, threshold):
-        cosine = cosine_similarity(chunk, self.train[self.use_cols])
+    def _process_chunk(self, chunk, k, threshold, subsample):
+        index = self.train.sample(frac=subsample).index
+        cosine = cosine_similarity(chunk, self.train.loc[index, self.use_cols])
         if threshold is not None:           # collect by threshold
             mask = cosine > threshold       # apply threshold
             np.fill_diagonal(mask, False)   # exclude ownes
             # return list(map(lambda m: self.df[m].mean().values, mask))
-            return np.apply_along_axis(lambda m: self.train[m].mean(), 1, mask)
+            return np.apply_along_axis(lambda m: self.train.loc[index][m].mean(), 1, mask)
         elif k is not None:     # collect by k nearest
             # return list(map(lambda c: self.df.iloc[np.argsort(c)[::-1][1:]].head(k).mean().values, cosine))
-            return np.apply_along_axis(lambda c: self.train.iloc[np.argsort(c)[::-1][1:]].head(k).mean(), 1, cosine)
+            return np.apply_along_axis(lambda c: self.train.loc[index].iloc[np.argsort(c)[::-1][1:]].head(k).mean(), 1, cosine)
 
-    def calculate(self, *, k=None, threshold=None, backend=None, chunksize=50):
+    def calculate(self, *, k=None, threshold=None, backend=None, chunksize=50, subsample=1.0):
         assert bool(k) ^ bool(threshold), 'Only one parameter must be specified: either `k` or `threshold`.'
 
         test_size = self.test.index.size
@@ -251,11 +253,11 @@ class CosineSimilarity:
         if backend is not None:
             with parallel_backend(backend):
                 result = (Parallel(n_jobs=-1)(
-                    delayed(self._process_chunk)(self.test[self.use_cols].iloc[start:start + chunksize], k, threshold) 
+                    delayed(self._process_chunk)(self.test[self.use_cols].iloc[start:start + chunksize], k, threshold, subsample) 
                         for start in tqdm(range(0, test_size, chunksize), total=chunk_count)
                 ))
         else:
-            result = [self._process_chunk(self.test[self.use_cols].iloc[start:start + chunksize], k, threshold)
+            result = [self._process_chunk(self.test[self.use_cols].iloc[start:start + chunksize], k, threshold, subsample)
                         for start in tqdm(range(0, test_size, chunksize), total=chunk_count)]
         # parse result
         for part in result:
@@ -267,10 +269,10 @@ class CosineSimilarity:
 
 
 @deprecated("It may take a VERY long time on large data, work unstable or don't work at all.")
-def cosine_stats(train, test, *, k=None, threshold=None, backend=None, chunksize=50):
+def cosine_stats(train, test, *, k=None, threshold=None, backend=None, chunksize=50, subsample=1.0):
     if backend is not None:
         os.environ['MKL_NUM_THREADS'] = '1'
     csim = CosineSimilarity(train, test)
-    stats = csim.calculate(k=k, threshold=threshold, backend=backend, chunksize=chunksize)
+    stats = csim.calculate(k=k, threshold=threshold, backend=backend, chunksize=chunksize, subsample=subsample)
     pred = test.fillna(stats)
     return pred
