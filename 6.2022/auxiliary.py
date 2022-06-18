@@ -6,9 +6,8 @@ from tqdm import tqdm
 from functools import wraps
 
 from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
+from sklearn.base import TransformerMixin
 from sklearn.metrics import mean_squared_error
-from typing import Mapping, Iterable
 
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.utils import parallel_backend
@@ -41,12 +40,14 @@ def save_submission(predicted):
     return sub.head()
 
 
-def deprecated(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        print(f"Using `{func.__name__}()` is deprecated! It may take a VERY long time on large data, work unstable or don't work at all.")
-        return func(*args, **kwargs)
-    return wrapper
+def deprecated(msg):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            print(f"Using `{func.__name__}()` is deprecated! {msg}")
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
 
 # =============================== Impute Helper Definition ===============================
 class Step:
@@ -54,8 +55,10 @@ class Step:
         """
         :param func - step function, must have signature like func(train, test, **params)
         :param columns - columns passed to function
-        :keyword max_fill_nan_count - max allowed number of NaN in row to predict value in it
-        :keywird max_train_nan_count - max allowed number of NaN in row to use it in train. NaN will be filled in with mean
+        :keyword inherit - use data calculated in the previous step; default = True
+        :keyword autosplit - automatically split data to train and test; default = True
+        :keyword max_fill_nan_count - max allowed number of NaN in row to predict value in it; default = np.inf
+        :keywird max_train_nan_count - max allowed number of NaN in row to use it in train. NaN will be filled in with mean; default = np.inf
         """
 
         assert func is not callable, "`func` parameter must be callable"
@@ -66,31 +69,35 @@ class Step:
         assert self.max_fill_nan_count >= 1, "`max_fill_nan_count` < 1 doesn't make sense. No value will be predicted."
         self.max_train_nan_count = kwargs.pop('max_train_nan_count', np.inf)
         assert self.max_train_nan_count >= 0, "`max_train_nan_count` < 0 doesn't make sense. No data left for training."
+        self.inherit = kwargs.pop('inherit', True)
+        self.autosplit = kwargs.pop('autosplit', True)
         self.params = kwargs
 
     def call(self, df):
         # train/test split
-        self.columns = self.columns if self.columns != 'all' else df.columns
-        fill_nan_count = df.isna().sum(axis=1) <= self.max_fill_nan_count
-        train_nan_count = df.isna().sum(axis=1) <= self.max_train_nan_count        
-        train = df.loc[train_nan_count, self.columns]
-        test = df.loc[fill_nan_count, self.columns]
-        return self.func(train, test, **self.params)
+        if self.autosplit:
+            self.columns = self.columns if self.columns != 'all' else df.columns
+            fill_nan_count = df.isna().sum(axis=1) <= self.max_fill_nan_count
+            train_nan_count = df.isna().sum(axis=1) <= self.max_train_nan_count        
+            train = df.loc[train_nan_count, self.columns]
+            test = df.loc[fill_nan_count, self.columns]
+            return self.func(train, test, **self.params)
+        else:
+            return self.func(df, **self.params)
 
 
 class ImputeHelper():
     def __init__(self, *steps):
         self.steps = steps
 
-    def run(self, data, inherit=True):
+    def run(self, data):
         """
         :params data - original dataset
-        :params inherit - put the previous result to the next step input
         """
         predicted = data.copy()
         for step in self.steps:            
             # call step function
-            step_result = step.call(predicted if inherit else data)
+            step_result = step.call(predicted if step.inherit else data)
             predicted.fillna(step_result, inplace=True)
         return predicted
 
@@ -151,10 +158,70 @@ def predictor(train, test, *, estimator):
     return pred
 
 
+# ====== Mean of k nearest values (modification of Predictive Mean Matching) ======
+# canonical PMM will be reached when using N=1
+def mean_matching(train, test=None, *, N, init, backend=None):
+    """ Mean of k nearest values (modification of Predictive Mean Matching)    
+    To use it as canonical PMM set N=1.
+    :param train - part of original data for calculating statistics or/and training initiator
+    :prarm test - part of original data in which NaN will be filled in
+    :param N - number of nearest values to use in statistic calculation
+    :param init - NaN initiator. Estimator, transformer or fixed value which is used to fill NaN in the first approximation
+    :param backend - parallel backend (for more information see sklearn docs)
+    """
+    if test is None:
+        test = train
+    test_nan = test.isna()
+
+    if hasattr(init, 'predict'):         # initiator is an estimator
+        initiated = test.copy()
+        metrics = []
+        for col in tqdm(train.columns[train.isna().any()], desc='Initiate values'):
+            # fit initiator
+            X_train = train[~train[col].isna()].drop(col, axis=1)
+            y_train = train.loc[~train[col].isna(), col]            
+            init.fit(X_train, y_train)
+            # calc initiator metric
+            train_pred = init.predict(X_train)
+            metrics.append(mean_squared_error(y_train, train_pred))
+            # predict init values
+            X_test = test[test[col].isna()].drop(col, axis=1)
+            initiated.loc[test[col].isna(), col] = init.predict(X_test)
+        print(f'Initiator avg. score: {np.mean(metrics)}')
+    elif isinstance(init, TransformerMixin):    # initiator is a transformer
+        initiated = pd.DataFrame(init.fit(train).transform(test), index=test.index, columns=test.columns)
+    else:                                       # initiator is a fixed value
+        initiated = pd.DataFrame(test.fillna(init), index=test.index, columns=test.columns)
+    # collect unique placeholders in each columns
+    uniques = initiated.apply(lambda col: col[test_nan[col.name]].unique())
+
+    def get_remapper(col_name):
+        unique = uniques[col_name]
+        if unique.size == 0:
+            return {}
+        column = train.loc[~train[col_name].isna(), col_name]
+        col_idx = train.columns.get_loc(column.name)
+
+        nearest = np.apply_along_axis(lambda val: np.abs(column - val).argsort()[:N], 0, [unique])      # collect N nearest items from train
+        statistics = np.apply_along_axis(lambda idx: train.iloc[idx, col_idx].mean(), 0, nearest)       # calc statistics for these nearest items
+        return dict(zip(unique, statistics))
+
+    if backend is not None:
+        with parallel_backend(backend):
+            colmaps = (Parallel()(delayed(get_remapper)(col) for col in tqdm(test.columns, desc='Collect remapper')))
+        remapper = dict(zip(test.columns, colmaps))
+    else:
+        remapper = {col: get_remapper(col) for col in tqdm(test.columns, desc='Collect remapper')}
+    # fill in
+    return initiated[test_nan].apply(lambda col: col.map(remapper[col.name], na_action='ignore')).fillna(initiated)
+    # return initiated[nans].replace(remapper).fillna(initiated)
 
 
+# ==================== Multiple imputation of chained equations ===================
+# not implemented yet
 
 
+# =============================== Cosine similarity ===============================
 # this takes a VERY long time
 class CosineSimilarity:
     def __init__(self, train, test):
@@ -199,7 +266,7 @@ class CosineSimilarity:
         return stats
 
 
-@deprecated
+@deprecated("It may take a VERY long time on large data, work unstable or don't work at all.")
 def cosine_stats(train, test, *, k=None, threshold=None, backend=None, chunksize=50):
     if backend is not None:
         os.environ['MKL_NUM_THREADS'] = '1'
