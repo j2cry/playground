@@ -71,6 +71,35 @@ def train_valid_split(df, *, frac, seed=None):
     return df.dropna().copy(), data
 
 
+# ================================= Decoration =================================
+class autosplit:
+    @classmethod
+    def allowed(cls, func):
+        @wraps(func)
+        def wrapper(train, test=None, *args, **kwargs):
+            if test is None:
+                test = train
+                print('Note: `test` data passed to the `{func.__name__}()` function is the same as `train`')
+            return func(train, test, *args, **kwargs)
+        return wrapper
+
+    @classmethod
+    def forbidden(cls, func):
+        @wraps(func)
+        def wrapper(train, test=None, *args, **kwargs):
+            assert test is None, f"This `{func.__name__}()` implementation requires the autosplit parameter to be set to False"
+            return func(train, *args, **kwargs)
+        return wrapper
+
+    @classmethod
+    def required(cls, func):
+        @wraps(func)
+        def wrapper(train, test=None, *args, **kwargs):
+            assert test is not None, f"This `{func.__name__}()` implementation requires the autosplit parameter to be set to True"
+            return func(train, test, *args, **kwargs)
+        return wrapper
+
+
 def deprecated(msg):
     def decorator(func):
         @wraps(func)
@@ -80,16 +109,16 @@ def deprecated(msg):
         return wrapper
     return decorator
 
-# =============================== Impute Helper Definition ===============================
+# ========================== Impute Helper Definition ==========================
 class Step:
     def __init__(self, func, columns, **kwargs):
-        """
+        """ Imputer step description
         :param func - step function, must have signature like func(train, test, **params)
         :param columns - columns passed to function
-        :keyword inherit - use data calculated in the previous step; default = True
-        :keyword autosplit - automatically split data to train and test; default = True
-        :keyword max_fill_nan_count - max allowed number of NaN in row to predict value in it; default = np.inf
-        :keywird max_train_nan_count - max allowed number of NaN in row to use it in train. NaN will be filled in with mean; default = np.inf
+        :keyword inherit - use data calculated in the previous step (default = True)
+        :keyword autosplit - automatically split data to train (rows without any NaN) and test (rows containing NaN) (default = True)
+        :keyword max_fill_nan_count - max allowed number of NaN in the row. Rows containing more NaN values are not passed to the function. (default = np.inf)
+        :keywird max_train_nan_count - max allowed number of NaN in the row. Rows containing more NaN values are not passed to the function. (default = np.inf)
         """
 
         assert func is not callable, "`func` parameter must be callable"
@@ -106,15 +135,15 @@ class Step:
 
     def call(self, df):
         # train/test split
+        self.columns = self.columns if self.columns != 'all' else df.columns
         if self.autosplit:
-            self.columns = self.columns if self.columns != 'all' else df.columns
             fill_nan_count = df.isna().sum(axis=1) <= self.max_fill_nan_count
             train_nan_count = df.isna().sum(axis=1) <= self.max_train_nan_count        
             train = df.loc[train_nan_count, self.columns]
             test = df.loc[fill_nan_count, self.columns]
             return self.func(train, test, **self.params)
         else:
-            return self.func(df, **self.params)
+            return self.func(df[self.columns], **self.params)
 
 
 class ImputeHelper():
@@ -122,8 +151,9 @@ class ImputeHelper():
         self.steps = steps
 
     def run(self, data, *, validate_on=None):
-        """
+        """ Run imputer
         :params data - original dataset
+        :validate_on - dataset for validation
         """
         predicted = data.copy()
         for step in self.steps:            
@@ -157,7 +187,8 @@ def calc_train_score(df, true_df, pred):
     return np.mean(metrics), overall
 
 
-# =============================== Imputer step functions ===============================
+# =========================== Imputer step functions ===========================
+@autosplit.allowed
 def simplestat(train, test, imputer=SimpleImputer()):
     """ Impute data with SimpleImputer """
     imputer.fit(train)
@@ -165,6 +196,7 @@ def simplestat(train, test, imputer=SimpleImputer()):
     return test.fillna(values)
 
 
+@autosplit.allowed
 def groupstat(train, test, *, gcol, func='mean'):
     """ Impute data with grouped statistics """
     stats = train.groupby(gcol).transform(func)
@@ -173,13 +205,14 @@ def groupstat(train, test, *, gcol, func='mean'):
     return test.fillna(stats)
 
 
+@autosplit.allowed
 def predictor(train, test, *, estimator):
     """ Impute data with one-per-column estimators """
     pred = test.copy()
     metrics = []
     nan_cols = test.columns[test.isna().any()]      # select columns to be filled in
 
-    for col in tqdm(nan_cols):
+    for col in (pbar := tqdm(nan_cols)):
         nan_target = train[col].isna()      # exclude rows without target from train
         target_mask = test[col].isna()      # select rows that are NaN in this columns
         # train/test split
@@ -193,13 +226,14 @@ def predictor(train, test, *, estimator):
         pred.loc[target_mask, col] = estimator.predict(X_test)
         # score pipeline
         metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))    # RMSE
-    print(f'\nML Imputer avg. score: {np.mean(metrics)}')
+        pbar.set_postfix({'avg. score': np.mean(metrics)})
     return pred
 
 
-# ====== Mean of k nearest values (modification of Predictive Mean Matching) ======
+# ===== Mean of k nearest values (modification of Predictive Mean Matching) ====
 # canonical PMM will be reached when using N=1
-def mean_matching(train, test=None, *, N, init, backend=None):
+@autosplit.allowed
+def mean_matching(train, test, *, N, init, backend=None):
     """ Mean of k nearest values (modification of Predictive Mean Matching)    
     To use it as canonical PMM set N=1.
     :param train - part of original data for calculating statistics or/and training initiator
@@ -208,8 +242,6 @@ def mean_matching(train, test=None, *, N, init, backend=None):
     :param init - NaN initiator. Estimator, transformer or fixed value which is used to fill NaN in the first approximation
     :param backend - parallel backend (for more information see sklearn docs)
     """
-    if test is None:
-        test = train
     test_nan = test.isna()
 
     if hasattr(init, 'predict'):         # initiator is an estimator
@@ -227,7 +259,6 @@ def mean_matching(train, test=None, *, N, init, backend=None):
             X_test = test[test[col].isna()].drop(col, axis=1)
             initiated.loc[test[col].isna(), col] = init.predict(X_test)
             pbar.set_postfix({'avg. score': np.mean(metrics)})
-        # print(f'Initiator avg. score: {np.mean(metrics)}')
     elif isinstance(init, TransformerMixin):    # initiator is a transformer
         initiated = pd.DataFrame(init.fit(train).transform(test), index=test.index, columns=test.columns)
     else:                                       # initiator is a fixed value
@@ -257,16 +288,15 @@ def mean_matching(train, test=None, *, N, init, backend=None):
     # return initiated[nans].replace(remapper).fillna(initiated)
 
 
-# ==================== Multiple imputation of chained equations ===================
-def mice(df, test=None, *, estimator, epochs=10, seed=None):
+# ================== Multiple imputation of chained equations ==================
+@autosplit.forbidden
+def mice(df, *, estimator, epochs=10, seed=None):
     """ Multiple imputation by chained equations
     :param df - original dataset
     :param estimator - estimetor used for imputation
     :param epochs - number of iterations
     :param seed - random seed to achieve repeatability
-    """
-    assert test is None, "This MICE implementation requires the autosplit parameter to be set to False"
-    
+    """    
     # initiate
     data = df.fillna(df.mean())
     nans = df.isna()
@@ -287,11 +317,10 @@ def mice(df, test=None, *, estimator, epochs=10, seed=None):
             # update mising values
             data.loc[nans[col], col] = estimator.predict(X_test)
             pbar.set_postfix({'avg. score': np.mean(epoch_metrics)})
-        # print(f'Epoch {n + 1} avg. score: {np.mean(epoch_metrics)}')
     return data
 
 
-# =============================== Cosine similarity ===============================
+# ============================== Cosine similarity =============================
 # this takes a VERY long time
 class CosineSimilarity:
     def __init__(self, train, test, *, seed=None):
@@ -339,6 +368,7 @@ class CosineSimilarity:
 
 
 @deprecated("It may take a VERY long time on large data, work unstable or don't work at all.")
+@autosplit.allowed
 def cosine_stats(train, test, *, k=None, threshold=None, backend=None, chunksize=50, subsample=1.0):
     if backend is not None:
         os.environ['MKL_NUM_THREADS'] = '1'
