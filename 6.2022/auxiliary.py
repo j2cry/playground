@@ -40,6 +40,37 @@ def save_submission(predicted):
     return sub.head()
 
 
+def train_valid_split(df, *, frac, seed=None):
+    """ Prepare data for validation
+    :param df - original dataset
+    :param frac - the percentage of data to be set in NaN
+    :param seed - random seed to achieve repeatability
+    :return True values and dataset with NaNs for validation
+    """
+    data = df.dropna().copy()
+    exclude_fixed = df.isna().any()
+    size = int(data.size * frac)
+    np.random.seed(seed)
+
+    nans = 0
+    candidates = np.array([[],[]])
+    while nans < size:
+        columns = data.columns[~data.isna().all() & exclude_fixed]      # select columns containing notNA values & exclude 
+        index = data.index[~data.isna().all(axis=1)]    # select rows containing notNA values
+        # generate NaN positions
+        col = np.random.choice(columns, size=size - nans, replace=True)
+        idx = np.random.choice(index, size=size - nans, replace=True)
+
+        candidates = np.hstack([candidates, np.vstack([idx, col])])
+        nans = pd.DataFrame(candidates.T).drop_duplicates().shape[0]
+
+    # drop chosen values
+    chosen = pd.DataFrame(candidates.T).drop_duplicates()
+    for col, idx, in chosen.groupby(1)[0].unique().iteritems():
+        data.loc[np.sort(idx), col] = np.nan
+    return df.dropna().copy(), data
+
+
 def deprecated(msg):
     def decorator(func):
         @wraps(func)
@@ -90,7 +121,7 @@ class ImputeHelper():
     def __init__(self, *steps):
         self.steps = steps
 
-    def run(self, data):
+    def run(self, data, *, validate_on=None):
         """
         :params data - original dataset
         """
@@ -99,30 +130,39 @@ class ImputeHelper():
             # call step function
             step_result = step.call(predicted if step.inherit else data)
             predicted.fillna(step_result, inplace=True)
+        if validate_on is not None:
+            score, overall = calc_train_score(data, validate_on, predicted)
+            print(f'Final validation score: {score}', f'Overall final score: {overall}', sep='\n')
         return predicted
 
 
-def calc_train_score(df, pred):
+def calc_train_score(df, true_df, pred):
+    """
+    :param df - dataset containing NaN
+    :param true_df - dataset with true values
+    :param pred - dataset with predicted values
+    """
     # compute score
     metrics = []
-    nan_cols = df.columns[df.isna().any()]
-    for col in tqdm(nan_cols):
-        nan_rows = df[col].isna()   # select rows that are NaN in this columns
-        y_train = df.loc[~nan_rows, col]
-        train_pred = pred.loc[~nan_rows, col]
+    nans = df.isna()
+    fully_predicted = ~pred.isna().any()
+    # iterate through columns that originally contain NaN and are fully predicted
+    for col in tqdm(df.columns[nans.any() & fully_predicted], desc='Final validation'):
+        y_train = true_df.loc[nans[col], col]
+        train_pred = pred.loc[nans[col], col]
         metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))
-    return np.mean(metrics)
+    # calc overall score
+    columns = df.columns[~nans.any() | fully_predicted]
+    overall = np.sqrt(mean_squared_error(true_df[columns], pred[columns]))
+    return np.mean(metrics), overall
 
 
 # =============================== Imputer step functions ===============================
 def simplestat(train, test, imputer=SimpleImputer()):
     """ Impute data with SimpleImputer """
     imputer.fit(train)
-    check = pd.DataFrame(imputer.transform(train), index=train.index, columns=train.columns)
-    print(f'Simple imputer avg. score: {calc_train_score(train, check)}')
     values = pd.DataFrame(imputer.transform(test), index=test.index, columns=test.columns)
-    pred = test.fillna(values)
-    return 
+    return test.fillna(values)
 
 
 def groupstat(train, test, *, gcol, func='mean'):
@@ -130,7 +170,6 @@ def groupstat(train, test, *, gcol, func='mean'):
     stats = train.groupby(gcol).transform(func)
     if stats.isna().any().any():
         print(f'Stats contain NaN! Data may not filled in completely!')
-    print(f'Groupstat imputer avg. score: {calc_train_score(train.drop(gcol, axis=1), stats)}')
     return test.fillna(stats)
 
 
@@ -176,18 +215,19 @@ def mean_matching(train, test=None, *, N, init, backend=None):
     if hasattr(init, 'predict'):         # initiator is an estimator
         initiated = test.copy()
         metrics = []
-        for col in tqdm(train.columns[train.isna().any()], desc='Initiate values'):
+        for col in (pbar := tqdm(train.columns[train.isna().any()], desc='Initiate values')):
             # fit initiator
             X_train = train[~train[col].isna()].drop(col, axis=1)
             y_train = train.loc[~train[col].isna(), col]            
             init.fit(X_train, y_train)
             # calc initiator metric
             train_pred = init.predict(X_train)
-            metrics.append(mean_squared_error(y_train, train_pred))
+            metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))
             # predict init values
             X_test = test[test[col].isna()].drop(col, axis=1)
             initiated.loc[test[col].isna(), col] = init.predict(X_test)
-        print(f'Initiator avg. score: {np.mean(metrics)}')
+            pbar.set_postfix({'avg. score': np.mean(metrics)})
+        # print(f'Initiator avg. score: {np.mean(metrics)}')
     elif isinstance(init, TransformerMixin):    # initiator is a transformer
         initiated = pd.DataFrame(init.fit(train).transform(test), index=test.index, columns=test.columns)
     else:                                       # initiator is a fixed value
@@ -234,7 +274,7 @@ def mice(df, test=None, *, estimator, epochs=10, seed=None):
 
     for n in range(epochs):
         epoch_metrics = []
-        for col in tqdm(data.columns[nans.any()], desc=f'Epoch {n + 1} / {epochs}'):
+        for col in (pbar := tqdm(data.columns[nans.any()], desc=f'Epoch {n + 1} / {epochs}')):
             # train/test split
             X_train = data[~nans[col]].drop(col, axis=1)
             y_train = data.loc[~nans[col], col]
@@ -243,10 +283,11 @@ def mice(df, test=None, *, estimator, epochs=10, seed=None):
             estimator.set_params(random_state=np.random.randint(2**32))
             estimator.fit(X_train, y_train)
             train_pred = estimator.predict(X_train)
-            epoch_metrics.append(mean_squared_error(y_train, train_pred))
+            epoch_metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))
             # update mising values
             data.loc[nans[col], col] = estimator.predict(X_test)
-        print(f'Epoch {n + 1} avg. score: {np.mean(epoch_metrics)}')
+            pbar.set_postfix({'avg. score': np.mean(epoch_metrics)})
+        # print(f'Epoch {n + 1} avg. score: {np.mean(epoch_metrics)}')
     return data
 
 
