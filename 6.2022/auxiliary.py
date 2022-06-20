@@ -5,7 +5,6 @@ import pandas as pd
 from tqdm import tqdm
 from functools import wraps
 
-from sklearn.impute import SimpleImputer
 from sklearn.base import TransformerMixin
 from sklearn.metrics import mean_squared_error
 
@@ -30,7 +29,8 @@ for n in range(n_sub):
 
 
 def save_submission(predicted):
-    print(f'Still contain NaN: {predicted.isna().any().any()}')
+    print(f'Data contain NaN: {predicted.isna().any().any()}')
+    print(f'Data contain inf: {((predicted == np.inf) | predicted == -np.inf).any().any()}')
     sub_path = path.joinpath('sample_submission.csv')
     # collect predictions
     sub = pd.read_csv(sub_path)
@@ -189,7 +189,7 @@ def calc_train_score(df, true_df, pred):
 
 # =========================== Imputer step functions ===========================
 @autosplit.allowed
-def simplestat(train, test, imputer=SimpleImputer()):
+def transformer(train, test, imputer):
     """ Impute data with SimpleImputer """
     imputer.fit(train)
     values = pd.DataFrame(imputer.transform(test), index=test.index, columns=test.columns)
@@ -200,9 +200,10 @@ def simplestat(train, test, imputer=SimpleImputer()):
 def groupstat(train, test, *, gcol, func='mean'):
     """ Impute data with grouped statistics """
     stats = train.groupby(gcol).transform(func)
-    if stats.isna().any().any():
-        print(f'Stats contain NaN! Data may not filled in completely!')
-    return test.fillna(stats)
+    pred = test.fillna(stats)
+    if pred.isna().any().any():
+        print(f'Stats contain NaN, so data was not filled in completely!')
+    return pred
 
 
 @autosplit.allowed
@@ -325,9 +326,14 @@ def mice(df, *, estimator, epochs=10, seed=None):
 class CosineSimilarity:
     def __init__(self, train, test, *, seed=None):
         nan_rows = test.isna().any(axis=1)
-        self.use_cols = train.columns[~train.isna().any() & ~test.isna().any()]
-        self.train = train
-        self.test = test[nan_rows]
+
+        self.use_cols = train.columns
+        self.train = train.fillna(train.mean())
+        self.test = test[nan_rows].fillna(test.mean())
+
+        # self.use_cols = train.columns[~train.isna().any() & ~test.isna().any()]
+        # self.train = train
+        # self.test = test[nan_rows]
         np.random.seed(seed)
     
     def _process_chunk(self, chunk, k, threshold, subsample):
@@ -369,10 +375,10 @@ class CosineSimilarity:
 
 @deprecated("It may take a VERY long time on large data, work unstable or don't work at all.")
 @autosplit.allowed
-def cosine_stats(train, test, *, k=None, threshold=None, backend=None, chunksize=50, subsample=1.0):
-    if backend is not None:
-        os.environ['MKL_NUM_THREADS'] = '1'
-    csim = CosineSimilarity(train, test)
+def cosine_stats(train, test, *, k=None, threshold=None, backend=None, chunksize=50, subsample=1.0, seed=None):
+    # if backend is not None:
+        # os.environ['MKL_NUM_THREADS'] = '1'
+    csim = CosineSimilarity(train, test, seed=seed)
     stats = csim.calculate(k=k, threshold=threshold, backend=backend, chunksize=chunksize, subsample=subsample)
     pred = test.fillna(stats)
     return pred
