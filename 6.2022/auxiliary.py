@@ -111,7 +111,7 @@ def deprecated(msg):
 
 # ========================== Impute Helper Definition ==========================
 class Step:
-    def __init__(self, func, columns, **kwargs):
+    def __init__(self, func, columns, *args, **kwargs):
         """ Imputer step description
         :param func - step function, must have signature like func(train, test, **params)
         :param columns - columns passed to function
@@ -131,7 +131,8 @@ class Step:
         assert self.max_train_nan_count >= 0, "`max_train_nan_count` < 0 doesn't make sense. No data left for training."
         self.inherit = kwargs.pop('inherit', True)
         self.autosplit = kwargs.pop('autosplit', True)
-        self.params = kwargs
+        self.args = args
+        self.kwargs = kwargs
 
     def call(self, df):
         # train/test split
@@ -141,9 +142,9 @@ class Step:
             train_nan_count = df.isna().sum(axis=1) <= self.max_train_nan_count        
             train = df.loc[train_nan_count, self.columns]
             test = df.loc[fill_nan_count, self.columns]
-            return self.func(train, test, **self.params)
+            return self.func(train, test, *self.args, **self.kwargs)
         else:
-            return self.func(df[self.columns], **self.params)
+            return self.func(df[self.columns], *self.args, **self.kwargs)
 
 
 class ImputeHelper():
@@ -207,7 +208,7 @@ def groupstat(train, test, *, gcol, func='mean'):
 
 
 @autosplit.allowed
-def predictor(train, test, *, estimator):
+def predictor(train, test, estimator, *, neural=False, **fit_params):
     """ Impute data with one-per-column estimators """
     pred = test.copy()
     metrics = []
@@ -222,12 +223,37 @@ def predictor(train, test, *, estimator):
         X_test = test[target_mask].drop(col, axis=1)
         
         # fit/predict
-        estimator.fit(X_train, y_train)
-        train_pred = estimator.predict(X_train)
-        pred.loc[target_mask, col] = estimator.predict(X_test)
+        estimator.fit(X_train, y_train, **fit_params)
+        if neural:
+            train_pred = estimator.predict(X_train).T[0]
+            pred.loc[target_mask, col] = estimator.predict(X_test).T[0]
+        else:
+            train_pred = estimator.predict(X_train)
+            pred.loc[target_mask, col] = estimator.predict(X_test)
         # score pipeline
         metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))    # RMSE
         pbar.set_postfix({'avg. score': np.mean(metrics)})
+    return pred
+
+
+@autosplit.allowed
+def onestep_neural(train, test, model, *, fill_columns, **fit_params):
+    """ Impute data with neural network with multidimensional output
+    To one-per-column approach use predictor(..., neural=True)
+    """
+    pred = test.copy()
+    nans = train[fill_columns].isna().any(axis=1)
+    X_train = train[~nans].drop(fill_columns, axis=1)
+    y_train = train.loc[~nans, fill_columns]
+    target_mask = test[fill_columns].isna().any(axis=1)
+    X_test = test[target_mask].drop(fill_columns, axis=1)
+
+    # fit/predict
+    model.fit(X_train, y_train, **fit_params)
+    train_pred = model.predict(X_train)
+    pred.loc[target_mask, fill_columns] = model.predict(X_test)
+    score = np.sqrt(mean_squared_error(y_train, train_pred))
+
     return pred
 
 
@@ -291,7 +317,7 @@ def mean_matching(train, test, *, N, init, backend=None):
 
 # ================== Multiple imputation of chained equations ==================
 @autosplit.forbidden
-def mice(df, *, estimator, epochs=10, seed=None):
+def mice(df, estimator, *, epochs=10, seed=None):
     """ Multiple imputation by chained equations
     :param df - original dataset
     :param estimator - estimetor used for imputation
