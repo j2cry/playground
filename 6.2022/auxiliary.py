@@ -75,12 +75,35 @@ def train_valid_split(df, *, frac, seed=None):
 class parameter:
     class initiator:
         @classmethod
-        def required(cls, func):
-            @wraps(func)
-            def wrapper(train, test, initiator=None, *args, **kwargs):
-                assert initiator is not None, f"This `{func.__name__}()` implementation requires an initiator."
-                return func(train, test, initiator, *args, **kwargs)
-            return wrapper
+        def required(cls, mode='any'):
+            def required_mode(func):
+                @wraps(func)
+                def wrapper(train, test, initiator, *args, **kwargs):
+                    assert initiator is not None, f"This `{func.__name__}()` implementation requires an initiator."
+                    if mode == 'predictor':
+                        assert hasattr(initiator, 'predict'), f"This `{func.__name__}()` implementation requires an estimator as the initiator."
+                    elif mode == 'transformer':
+                        assert isinstance(initiator, TransformerMixin), f"This `{func.__name__}()` implementation requires a transformer as the initiator."
+                    return func(train, test, initiator, *args, **kwargs)
+                return wrapper
+            return required_mode
+
+        @classmethod
+        def allowed(cls, mode='any'):
+            def allowed_mode(func):
+                @wraps(func)
+                def wrapper(train, test, initiator, *args, **kwargs):
+                    if initiator is not None:
+                        if mode == 'predictor':
+                            assert hasattr(initiator, 'predict'), f"This `{func.__name__}()` implementation allows only an estimator as the initiator."
+                        elif mode == 'transformer':
+                            assert isinstance(initiator, TransformerMixin), f"This `{func.__name__}()` implementation allows only a transformer as the initiator."
+                        elif mode == 'any':
+                            print("Using `@parameter.initiator.allowed('any')` is redundant")
+                    return func(train, test, initiator, *args, **kwargs)
+                return wrapper
+            return allowed_mode
+
 
     class intersection:
         @staticmethod
@@ -108,7 +131,7 @@ class parameter:
             return wrapper
 
         @classmethod
-        def required(cls, mode):
+        def required(cls, mode='total'):
             def required_mode(func):
                 @wraps(func)
                 def wrapper(train, test, *args, **kwargs):
@@ -222,8 +245,8 @@ def calc_train_score(df, true_df, pred):
 
 
 # =========================== Imputer step functions ===========================
-@parameter.initiator.required
 @parameter.intersection.required('total')
+@parameter.initiator.required('transformer')
 def transformer(train, test, initiator):
     """ Impute data with given transformer """
     initiator.fit(train)
@@ -243,6 +266,7 @@ def groupstat(train, test, initiator, *, gcol, func='mean'):
 
 
 @parameter.intersection.required('total')
+@parameter.initiator.allowed('transformer')
 def predictor(train, test, initiator, estimator, *, neural=False, **fit_params):
     """ Impute data with one-per-column estimators """
     # initialize missing values
@@ -280,6 +304,7 @@ def predictor(train, test, initiator, estimator, *, neural=False, **fit_params):
 
 
 @parameter.intersection.required('total')
+@parameter.initiator.allowed('transformer')
 def onestep_neural(train, test, initiator, model, **fit_params):
     """ Impute data with neural network with multidimensional output
     To one-per-column approach use predictor(..., neural=True)
@@ -288,7 +313,7 @@ def onestep_neural(train, test, initiator, model, **fit_params):
     if initiator is None:
         train_init = train
         test_init = test
-    else:        
+    else:
         train_init = pd.DataFrame(initiator.fit_transform(train), index=train.index, columns=train.columns)
         test_init = pd.DataFrame(initiator.transform(test), index=test.index, columns=test.columns)
 
@@ -308,62 +333,65 @@ def onestep_neural(train, test, initiator, model, **fit_params):
     return pred
 
 
-# # ===== Mean of k nearest values (modification of Predictive Mean Matching) ====
-# # canonical PMM will be reached when using N=1
-# @autosplit.allowed
-# def mean_matching(train, test, *, N, init, backend=None):
-#     """ Mean of k nearest values (modification of Predictive Mean Matching)    
-#     To use it as canonical PMM set N=1.
-#     :param train - part of original data for calculating statistics or/and training initiator
-#     :prarm test - part of original data in which NaN will be filled in
-#     :param N - number of nearest values to use in statistic calculation
-#     :param init - NaN initiator. Estimator, transformer or fixed value which is used to fill NaN in the first approximation
-#     :param backend - parallel backend (for more information see sklearn docs)
-#     """
-#     test_nan = test.isna()
+# ===== Mean of k nearest values (modification of Predictive Mean Matching) ====
+# canonical PMM will be reached when using N=1
+@parameter.intersection.required('total')
+@parameter.initiator.required('any')
+def mean_matching(train, test, initiator, *, N, backend=None):
+    """ Mean of k nearest values (modification of Predictive Mean Matching)    
+    To use it as canonical PMM set N=1.
+    :param train - part of original data for calculating statistics or/and training initiator
+    :prarm test - part of original data in which NaN will be filled in
+    :param N - number of nearest values to use in statistic calculation
+    :param backend - parallel backend (for more information see sklearn docs)
+    """
+    if hasattr(initiator, 'predict'):
+        # initiator is an estimator
+        initiated = test.copy()
+        metrics = []
+        for col in (pbar := tqdm(train.columns[train.isna().any()], desc='Initiate values')):
+            # fit initiator
+            X_train = train[~train[col].isna()].drop(col, axis=1)
+            y_train = train.loc[~train[col].isna(), col]            
+            initiator.fit(X_train, y_train)
+            # calc initiator metric
+            train_pred = initiator.predict(X_train)
+            metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))
+            # predict init values
+            X_test = test[test[col].isna()].drop(col, axis=1)
+            initiated.loc[test[col].isna(), col] = initiator.predict(X_test)
+            pbar.set_postfix({'avg. score': np.mean(metrics)})
+    elif isinstance(initiator, TransformerMixin):
+        # initiator is a transformer
+        initiated = pd.DataFrame(initiator.fit(train).transform(test), index=test.index, columns=test.columns)
+    else:
+        # initiator is a fixed value
+        initiated = pd.DataFrame(test.fillna(initiator), index=test.index, columns=test.columns)
 
-#     if hasattr(init, 'predict'):         # initiator is an estimator
-#         initiated = test.copy()
-#         metrics = []
-#         for col in (pbar := tqdm(train.columns[train.isna().any()], desc='Initiate values')):
-#             # fit initiator
-#             X_train = train[~train[col].isna()].drop(col, axis=1)
-#             y_train = train.loc[~train[col].isna(), col]            
-#             init.fit(X_train, y_train)
-#             # calc initiator metric
-#             train_pred = init.predict(X_train)
-#             metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))
-#             # predict init values
-#             X_test = test[test[col].isna()].drop(col, axis=1)
-#             initiated.loc[test[col].isna(), col] = init.predict(X_test)
-#             pbar.set_postfix({'avg. score': np.mean(metrics)})
-#     elif isinstance(init, TransformerMixin):    # initiator is a transformer
-#         initiated = pd.DataFrame(init.fit(train).transform(test), index=test.index, columns=test.columns)
-#     else:                                       # initiator is a fixed value
-#         initiated = pd.DataFrame(test.fillna(init), index=test.index, columns=test.columns)
-#     # collect unique placeholders in each columns
-#     uniques = initiated.apply(lambda col: col[test_nan[col.name]].unique())
+    # collect unique placeholders in each columns
+    test_nan = test.isna()
+    uniques = initiated.apply(lambda col: col[test_nan[col.name]].unique())
 
-#     def get_remapper(col_name):
-#         unique = uniques[col_name]
-#         if unique.size == 0:
-#             return {}
-#         column = train.loc[~train[col_name].isna(), col_name]
-#         col_idx = train.columns.get_loc(column.name)
+    def get_remapper(col_name):
+        unique = uniques[col_name]
+        if unique.size == 0:
+            return {}
+        column = train.loc[~train[col_name].isna(), col_name]
+        col_idx = train.columns.get_loc(column.name)
 
-#         nearest = np.apply_along_axis(lambda val: np.abs(column - val).argsort()[:N], 0, [unique])      # collect N nearest items from train
-#         statistics = np.apply_along_axis(lambda idx: train.iloc[idx, col_idx].mean(), 0, nearest)       # calc statistics for these nearest items
-#         return dict(zip(unique, statistics))
+        nearest = np.apply_along_axis(lambda val: np.abs(column - val).argsort()[:N], 0, [unique])      # collect N nearest items from train
+        statistics = np.apply_along_axis(lambda idx: train.iloc[idx, col_idx].mean(), 0, nearest)       # calc statistics for these nearest items
+        return dict(zip(unique, statistics))
 
-#     if backend is not None:
-#         with parallel_backend(backend):
-#             colmaps = (Parallel()(delayed(get_remapper)(col) for col in tqdm(test.columns, desc='Collect remapper')))
-#         remapper = dict(zip(test.columns, colmaps))
-#     else:
-#         remapper = {col: get_remapper(col) for col in tqdm(test.columns, desc='Collect remapper')}
-#     # fill in
-#     return initiated[test_nan].apply(lambda col: col.map(remapper[col.name], na_action='ignore')).fillna(initiated)
-#     # return initiated[nans].replace(remapper).fillna(initiated)
+    if backend is not None:
+        with parallel_backend(backend):
+            colmaps = (Parallel()(delayed(get_remapper)(col) for col in tqdm(test.columns, desc='Collect remapper')))
+        remapper = dict(zip(test.columns, colmaps))
+    else:
+        remapper = {col: get_remapper(col) for col in tqdm(test.columns, desc='Collect remapper')}
+    # fill in
+    return initiated[test_nan].apply(lambda col: col.map(remapper[col.name], na_action='ignore')).fillna(initiated)
+    # return initiated[nans].replace(remapper).fillna(initiated)
 
 
 # # ================== Multiple imputation of chained equations ==================
@@ -398,64 +426,66 @@ def onestep_neural(train, test, initiator, model, **fit_params):
 #     return data
 
 
-# # ============================== Cosine similarity =============================
-# # this takes a VERY long time
-# class CosineSimilarity:
-#     def __init__(self, train, test, *, seed=None):
-#         nan_rows = test.isna().any(axis=1)
-
-#         self.use_cols = train.columns
-#         self.train = train.fillna(train.mean())
-#         self.test = test[nan_rows].fillna(test.mean())
-
-#         # self.use_cols = train.columns[~train.isna().any() & ~test.isna().any()]
-#         # self.train = train
-#         # self.test = test[nan_rows]
-#         np.random.seed(seed)
+# ============================== Cosine similarity =============================
+# this takes a VERY long time
+class CosineSimilarity:
+    def __init__(self, train, test, *, seed=None):
+        self.use_cols = train.columns
+        self.train = train
+        self.test = test
+        np.random.seed(seed)
     
-#     def _process_chunk(self, chunk, k, threshold, subsample):
-#         index = self.train.sample(frac=subsample).index
-#         cosine = cosine_similarity(chunk, self.train.loc[index, self.use_cols])
-#         if threshold is not None:           # collect by threshold
-#             mask = cosine > threshold       # apply threshold
-#             np.fill_diagonal(mask, False)   # exclude ownes
-#             # return list(map(lambda m: self.df[m].mean().values, mask))
-#             return np.apply_along_axis(lambda m: self.train.loc[index][m].mean(), 1, mask)
-#         elif k is not None:     # collect by k nearest
-#             # return list(map(lambda c: self.df.iloc[np.argsort(c)[::-1][1:]].head(k).mean().values, cosine))
-#             return np.apply_along_axis(lambda c: self.train.loc[index].iloc[np.argsort(c)[::-1][1:]].head(k).mean(), 1, cosine)
+    def _process_chunk(self, chunk, k, threshold, subsample):
+        index = self.train.sample(frac=subsample).index
+        cosine = cosine_similarity(chunk, self.train.loc[index, self.use_cols])
+        if threshold is not None:           # collect by threshold
+            mask = cosine > threshold       # apply threshold
+            np.fill_diagonal(mask, False)   # exclude ownes
+            # return list(map(lambda m: self.df[m].mean().values, mask))
+            return np.apply_along_axis(lambda m: self.train.loc[index][m].mean(), 1, mask)
+        elif k is not None:     # collect by k nearest
+            # return list(map(lambda c: self.df.iloc[np.argsort(c)[::-1][1:]].head(k).mean().values, cosine))
+            return np.apply_along_axis(lambda c: self.train.loc[index].iloc[np.argsort(c)[::-1][1:]].head(k).mean(), 1, cosine)
 
-#     def calculate(self, *, k=None, threshold=None, backend=None, chunksize=50, subsample=1.0):
-#         assert bool(k) ^ bool(threshold), 'Only one parameter must be specified: either `k` or `threshold`.'
+    def calculate(self, *, k=None, threshold=None, backend=None, chunksize=50, subsample=1.0):
+        assert bool(k) ^ bool(threshold), 'Only one parameter must be specified: either `k` or `threshold`.'
 
-#         test_size = self.test.index.size
-#         chunk_count = test_size // chunksize + (1 if test_size % chunksize else 0)
-#         print(f'{test_size} rows in {chunk_count} chunks')
-#         arr = []
-#         if backend is not None:
-#             with parallel_backend(backend):
-#                 result = (Parallel(n_jobs=-1)(
-#                     delayed(self._process_chunk)(self.test[self.use_cols].iloc[start:start + chunksize], k, threshold, subsample) 
-#                         for start in tqdm(range(0, test_size, chunksize), total=chunk_count)
-#                 ))
-#         else:
-#             result = [self._process_chunk(self.test[self.use_cols].iloc[start:start + chunksize], k, threshold, subsample)
-#                         for start in tqdm(range(0, test_size, chunksize), total=chunk_count)]
-#         # parse result
-#         for part in result:
-#             arr.extend(part)
-#         stats = pd.DataFrame(arr, index=self.test.index, columns=self.test.columns)
-#         if stats.isna().any().any():
-#             print('Some values are NaN. Try decrease threshold.')
-#         return stats
+        test_size = self.test.index.size
+        chunk_count = test_size // chunksize + (1 if test_size % chunksize else 0)
+        print(f'{test_size} rows in {chunk_count} chunks')
+        arr = []
+        if backend is not None:
+            with parallel_backend(backend):
+                result = (Parallel(n_jobs=-1)(
+                    delayed(self._process_chunk)(self.test[self.use_cols].iloc[start:start + chunksize], k, threshold, subsample) 
+                        for start in tqdm(range(0, test_size, chunksize), total=chunk_count)
+                ))
+        else:
+            result = [self._process_chunk(self.test[self.use_cols].iloc[start:start + chunksize], k, threshold, subsample)
+                        for start in tqdm(range(0, test_size, chunksize), total=chunk_count)]
+        # parse result
+        for part in result:
+            arr.extend(part)
+        stats = pd.DataFrame(arr, index=self.test.index, columns=self.test.columns)
+        if stats.isna().any().any():
+            print('Some values are NaN. Try decrease threshold.')
+        return stats
 
 
-# @deprecated("It may take a VERY long time on large data, work unstable or don't work at all.")
-# @autosplit.allowed
-# def cosine_stats(train, test, *, k=None, threshold=None, backend=None, chunksize=50, subsample=1.0, seed=None):
-#     # if backend is not None:
-#         # os.environ['MKL_NUM_THREADS'] = '1'
-#     csim = CosineSimilarity(train, test, seed=seed)
-#     stats = csim.calculate(k=k, threshold=threshold, backend=backend, chunksize=chunksize, subsample=subsample)
-#     pred = test.fillna(stats)
-#     return pred
+@deprecated("It may take a VERY long time on large data, work unstable or don't work at all.")
+@parameter.intersection.required('total')
+@parameter.initiator.required('transformer')
+def cosine_stats(train, test, initiator, *, k=None, threshold=None, backend=None, chunksize=50, subsample=1.0, seed=None):
+    # initialize missing values
+    if initiator is None:
+        train_init = train
+        test_init = test
+    else:
+        train_init = pd.DataFrame(initiator.fit_transform(train), index=train.index, columns=train.columns)
+        test_init = pd.DataFrame(initiator.transform(test), index=test.index, columns=test.columns)
+
+    # if backend is not None:
+        # os.environ['MKL_NUM_THREADS'] = '1'
+    csim = CosineSimilarity(train_init, test_init, seed=seed)
+    stats = csim.calculate(k=k, threshold=threshold, backend=backend, chunksize=chunksize, subsample=subsample)
+    return test.fillna(stats)
