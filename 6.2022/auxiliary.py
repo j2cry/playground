@@ -1,4 +1,3 @@
-import os
 import pathlib
 import numpy as np
 import pandas as pd
@@ -166,7 +165,7 @@ class Step:
         :param max_fit_nan_count - max allowed number of NaN in the train row. Rows containing more NaN values are not passed to the function. (default = np.inf)
         :param max_fill_nan_count - max allowed number of NaN in the filling row. Rows containing more NaN values are not passed to the function. (default = np.inf)
         :param inherit - use data calculated in the previous step (default = True)
-        :param initiator - transformer for initiating NaN in train
+        :param initiator - strategy for initiating NaN
         """
 
         assert func is not callable, "`func` parameter must be callable"
@@ -342,6 +341,7 @@ def mean_matching(train, test, initiator, *, N, backend=None):
     To use it as canonical PMM set N=1.
     :param train - part of original data for calculating statistics or/and training initiator
     :prarm test - part of original data in which NaN will be filled in
+    :param initiator - strategy for initiating NaN
     :param N - number of nearest values to use in statistic calculation
     :param backend - parallel backend (for more information see sklearn docs)
     """
@@ -394,36 +394,41 @@ def mean_matching(train, test, initiator, *, N, backend=None):
     # return initiated[nans].replace(remapper).fillna(initiated)
 
 
-# # ================== Multiple imputation of chained equations ==================
-# @autosplit.forbidden
-# def mice(df, estimator, *, epochs=10, seed=None):
-#     """ Multiple imputation by chained equations
-#     :param df - original dataset
-#     :param estimator - estimetor used for imputation
-#     :param epochs - number of iterations
-#     :param seed - random seed to achieve repeatability
-#     """    
-#     # initiate
-#     data = df.fillna(df.mean())
-#     nans = df.isna()
-#     np.random.seed(seed)
+# ================== Multiple imputation of chained equations ==================
+@parameter.intersection.required('total')
+@parameter.initiator.required('transformer')
+def mice(train, test, initiator, estimator, *, epochs=5, seed=None):
+    """ Multiple imputation by chained equations
+    :param train - part of original data for calculating statistics or/and training initiator
+    :prarm test - part of original data in which NaN will be filled in
+    :param initiator - strategy for initiating NaN
+    :param estimator - estimetor used for imputation
+    :param epochs - number of iterations
+    :param seed - random seed to achieve repeatability
+    """    
+    # concat train and test
+    concatenated = pd.concat([train, test], axis=0).drop_duplicates()
+    # initialize missing values
+    data = pd.DataFrame(initiator.fit_transform(concatenated), index=concatenated.index, columns=concatenated.columns)
+    nans = concatenated.isna()
+    np.random.seed(seed)
 
-#     for n in range(epochs):
-#         epoch_metrics = []
-#         for col in (pbar := tqdm(data.columns[nans.any()], desc=f'Epoch {n + 1} / {epochs}')):
-#             # train/test split
-#             X_train = data[~nans[col]].drop(col, axis=1)
-#             y_train = data.loc[~nans[col], col]
-#             X_test = data[nans[col]].drop(col, axis=1)
-#             # fit/predict        
-#             estimator.set_params(random_state=np.random.randint(2**32))
-#             estimator.fit(X_train, y_train)
-#             train_pred = estimator.predict(X_train)
-#             epoch_metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))
-#             # update mising values
-#             data.loc[nans[col], col] = estimator.predict(X_test)
-#             pbar.set_postfix({'avg. score': np.mean(epoch_metrics)})
-#     return data
+    for n in range(epochs):
+        epoch_metrics = []
+        for col in (pbar := tqdm(data.columns[nans.any()], desc=f'Epoch {n + 1} / {epochs}')):
+            # train/test split
+            X_train = data[~nans[col]].drop(col, axis=1)
+            y_train = data.loc[~nans[col], col]
+            X_test = data[nans[col]].drop(col, axis=1)
+            # fit/predict        
+            estimator.set_params(random_state=np.random.randint(2**32))
+            estimator.fit(X_train, y_train)
+            train_pred = estimator.predict(X_train)
+            epoch_metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))
+            # update mising values
+            data.loc[nans[col], col] = estimator.predict(X_test)
+            pbar.set_postfix({'avg. score': np.mean(epoch_metrics)})
+    return data
 
 
 # ============================== Cosine similarity =============================
