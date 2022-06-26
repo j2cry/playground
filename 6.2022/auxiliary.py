@@ -104,48 +104,6 @@ class parameter:
             return allowed_mode
 
 
-    class intersection:
-        @staticmethod
-        def __columns_intersection(train, test):
-            """ Check fit/fill columns intersection """
-            return train.columns.intersection(test.columns)
-
-        # @classmethod
-        # def allowed(cls, func):
-        #     @wraps(func)
-        #     def wrapper(train, test, *args, **kwargs):
-        #         # if test is None:
-        #         #     test = train
-        #         #     print('Note: `test` data passed to the `{func.__name__}()` function is the same as `train`')
-        #         return func(train, test, *args, **kwargs)
-        #     return wrapper
-
-        @classmethod
-        def forbidden(cls, func):
-            @wraps(func)
-            def wrapper(train, test, *args, **kwargs):
-                intersection = cls.__columns_intersection(train, test)
-                assert intersection.size > 0, f"This `{func.__name__}()` implementation requires no fit and fill columns intersection."
-                return func(train, test, *args, **kwargs)
-            return wrapper
-
-        @classmethod
-        def required(cls, mode='total'):
-            def required_mode(func):
-                @wraps(func)
-                def wrapper(train, test, *args, **kwargs):
-                    intersection = cls.__columns_intersection(train, test)
-                    if mode == 'total':
-                        assert intersection.size == train.columns.size == test.columns.size, f"This `{func.__name__}()` implementation requires the same `fill` columns as they were in fit."
-                    elif mode == 'test_in_train':
-                        assert intersection.size == test.columns.size, f"This `{func.__name__}()` implementation requires `fill` columns to be in train data."
-                    else:
-                        raise ValueError('Unknown mode intersection mode `{mode}`')
-                    return func(train, test, *args, **kwargs)
-                return wrapper
-            return required_mode
-
-
 def deprecated(msg):
     def decorator(func):
         @wraps(func)
@@ -161,7 +119,7 @@ class Step:
         """ Imputer step description
         :param func - step function, must have signature like func(train, test, **params)
         :param fit_columns - columns to use in train
-        :param fill_columns - columns to fill in. Is the same as `fit_columns` if None
+        :param fill_columns - columns to fill in. Must be a subset of `fit_columns`. Is the same as `fit_columns` if None
         :param max_fit_nan_count - max allowed number of NaN in the train row. Rows containing more NaN values are not passed to the function. (default = np.inf)
         :param max_fill_nan_count - max allowed number of NaN in the filling row. Rows containing more NaN values are not passed to the function. (default = np.inf)
         :param inherit - use data calculated in the previous step (default = True)
@@ -183,23 +141,21 @@ class Step:
         self.kwargs = kwargs
 
     def call(self, df):
-        # check if fit columns contain NaN
-        self.fit_columns = self.fit_columns if self.fit_columns != 'all' else df.columns
-        nan_train = df[self.fit_columns].isna()
-        # assert self.initiator is not None or not nan_train.any().any(), "Train data contains NaN while initiator is not specified"
+        self.fit_columns = df.columns if self.fit_columns == 'all' else self.fit_columns
+        self.fill_columns = df.columns if self.fill_columns == 'all' else self.fill_columns
+        assert set(self.fill_columns).issubset(self.fit_columns), f"`{self.func.__name__}()`: fill_columns must be a subset of fit_columns."
 
         # check if fill columns contain NaN
-        self.fill_columns = self.fill_columns if self.fill_columns != 'all' else df.columns
         nan_fill = df[self.fill_columns].isna()
         assert nan_fill.any().any(), f"`{self.func.__name__}()`: No NaN values to fill in"
 
         # apply nan count filters
-        fit_nan_count = nan_train.sum(axis=1) <= self.max_fit_nan_count
+        fit_nan_count = df[self.fit_columns].isna().sum(axis=1) <= self.max_fit_nan_count
         fill_nan_count = nan_fill.sum(axis=1) <= self.max_fill_nan_count
-        train = df.loc[fit_nan_count, self.fit_columns]      # select required train part
-        test = df.loc[fill_nan_count, self.fill_columns]
+        train = df.loc[fit_nan_count, self.fit_columns]     # select required train part
+        test = df.loc[fill_nan_count, self.fit_columns]     # select required test part
 
-        return self.func(train, test, initiator=self.initiator, **self.kwargs)
+        return self.func(train, test, initiator=self.initiator, fill_columns=self.fill_columns, **self.kwargs)
 
 
 class ImputeHelper():
@@ -243,43 +199,48 @@ def calc_train_score(df, true_df, pred):
     return np.mean(metrics), overall
 
 
+def data_initialize(initiator, train, test, concat=False):
+    """ Initialize missing values with given initiator """
+
+    pass
+
 # =========================== Imputer step functions ===========================
-@parameter.intersection.required('total')
 @parameter.initiator.required('transformer')
-def transformer(train, test, initiator):
+def transformer(train, test, initiator, fill_columns, **kwargs):
     """ Impute data with given transformer """
     initiator.fit(train)
     values = pd.DataFrame(initiator.transform(test), index=test.index, columns=test.columns)
-    return test.fillna(values)
+    return test[fill_columns].fillna(values)
 
 
-@parameter.intersection.required('test_in_train')
-def groupstat(train, test, initiator, *, gcol, func='mean'):
+@parameter.initiator.allowed('transformer')
+def groupstat(train, test, initiator, fill_columns, *, gcol, func='mean'):
     """ Impute data with grouped statistics """
-    init = train if initiator is None else pd.DataFrame(initiator.fit_transform(train), index=train.index, columns=train.columns)
-    stats = init.groupby(gcol).transform(func)
-    pred = test.fillna(stats)
+    train_init = train if initiator is None else pd.DataFrame(initiator.fit_transform(train), index=train.index, columns=train.columns)
+    # TODO check fill_columns and gcol intersection
+    assert len(set(gcol).intersection(fill_columns)) == 0, f"`gcol` cannot intersect with fill_columns."
+    stats = train_init.groupby(gcol).transform(func)
+    pred = test[fill_columns].fillna(stats)
     if pred.isna().any().any():
         print(f'Stats contain NaN, so data was not filled in completely!')
     return pred
 
 
-@parameter.intersection.required('total')
 @parameter.initiator.allowed('transformer')
-def predictor(train, test, initiator, estimator, *, neural=False, **fit_params):
+def predictor(train, test, initiator, fill_columns, *, estimator, neural=False, **fit_params):
     """ Impute data with one-per-column estimators """
     # initialize missing values
     if initiator is None:
         train_init = train
         test_init = test
-    else:        
+    else:
         train_init = pd.DataFrame(initiator.fit_transform(train), index=train.index, columns=train.columns)
         test_init = pd.DataFrame(initiator.transform(test), index=test.index, columns=test.columns)
 
     pred = test.copy()
     metrics = []
-    nan_cols = test.columns[test.isna().any()]      # select columns to be filled in
 
+    nan_cols = test.columns[test.isna().any()].intersection(fill_columns)      # select columns to be filled in
     for col in (pbar := tqdm(nan_cols)):
         nan_target = train[col].isna()      # exclude rows without target from train
         target_mask = test[col].isna()      # select rows that are NaN in this columns
@@ -287,7 +248,6 @@ def predictor(train, test, initiator, estimator, *, neural=False, **fit_params):
         X_train = train_init[~nan_target].drop(col, axis=1)
         y_train = train_init.loc[~nan_target, col]
         X_test = test_init[target_mask].drop(col, axis=1)
-        
         # fit/predict
         estimator.fit(X_train, y_train, **fit_params)
         if neural:
@@ -302,9 +262,8 @@ def predictor(train, test, initiator, estimator, *, neural=False, **fit_params):
     return pred
 
 
-@parameter.intersection.required('total')
 @parameter.initiator.allowed('transformer')
-def onestep_neural(train, test, initiator, model, **fit_params):
+def onestep_neural(train, test, initiator, fill_columns, *, model, **fit_params):
     """ Impute data with neural network with multidimensional output
     To one-per-column approach use predictor(..., neural=True)
     """
@@ -316,7 +275,6 @@ def onestep_neural(train, test, initiator, model, **fit_params):
         train_init = pd.DataFrame(initiator.fit_transform(train), index=train.index, columns=train.columns)
         test_init = pd.DataFrame(initiator.transform(test), index=test.index, columns=test.columns)
 
-    fill_columns = train.columns[train.isna().any()]
     pred = test.copy()
     nans = train[fill_columns].isna().any(axis=1)
     X_train = train_init[~nans].drop(fill_columns, axis=1)
@@ -334,9 +292,8 @@ def onestep_neural(train, test, initiator, model, **fit_params):
 
 # ===== Mean of k nearest values (modification of Predictive Mean Matching) ====
 # canonical PMM will be reached when using N=1
-@parameter.intersection.required('total')
 @parameter.initiator.required('any')
-def mean_matching(train, test, initiator, *, N, backend=None):
+def mean_matching(train, test, initiator, fill_columns, *, N, backend=None):
     """ Mean of k nearest values (modification of Predictive Mean Matching)    
     To use it as canonical PMM set N=1.
     :param train - part of original data for calculating statistics or/and training initiator
@@ -368,9 +325,9 @@ def mean_matching(train, test, initiator, *, N, backend=None):
         # initiator is a fixed value
         initiated = pd.DataFrame(test.fillna(initiator), index=test.index, columns=test.columns)
 
-    # collect unique placeholders in each columns
-    test_nan = test.isna()
-    uniques = initiated.apply(lambda col: col[test_nan[col.name]].unique())
+    # collect unique values in each fill_column
+    fill_nan = test[fill_columns].isna()
+    uniques = initiated[fill_columns].apply(lambda col: col[fill_nan[col.name]].unique())
 
     def get_remapper(col_name):
         unique = uniques[col_name]
@@ -385,19 +342,18 @@ def mean_matching(train, test, initiator, *, N, backend=None):
 
     if backend is not None:
         with parallel_backend(backend):
-            colmaps = (Parallel()(delayed(get_remapper)(col) for col in tqdm(test.columns, desc='Collect remapper')))
-        remapper = dict(zip(test.columns, colmaps))
+            colmaps = (Parallel()(delayed(get_remapper)(col) for col in tqdm(fill_columns, desc='Collect remapper')))
+        remapper = dict(zip(fill_columns, colmaps))
     else:
-        remapper = {col: get_remapper(col) for col in tqdm(test.columns, desc='Collect remapper')}
+        remapper = {col: get_remapper(col) for col in tqdm(fill_columns, desc='Collect remapper')}
     # fill in
-    return initiated[test_nan].apply(lambda col: col.map(remapper[col.name], na_action='ignore')).fillna(initiated)
+    return initiated[fill_columns].apply(lambda col: col.map(remapper[col.name], na_action='ignore')).fillna(initiated[fill_columns])
     # return initiated[nans].replace(remapper).fillna(initiated)
 
 
 # ================== Multiple imputation of chained equations ==================
-@parameter.intersection.required('total')
-@parameter.initiator.required('transformer')
-def mice(train, test, initiator, estimator, *, epochs=5, seed=None):
+@parameter.initiator.required('any')
+def mice(train, test, initiator, fill_columns, *, estimator, epochs=5, seed=None):
     """ Multiple imputation by chained equations
     :param train - part of original data for calculating statistics or/and training initiator
     :prarm test - part of original data in which NaN will be filled in
@@ -409,26 +365,49 @@ def mice(train, test, initiator, estimator, *, epochs=5, seed=None):
     # concat train and test
     concatenated = pd.concat([train, test], axis=0).drop_duplicates()
     # initialize missing values
-    data = pd.DataFrame(initiator.fit_transform(concatenated), index=concatenated.index, columns=concatenated.columns)
-    nans = concatenated.isna()
-    np.random.seed(seed)
+    if hasattr(initiator, 'predict'):
+        # initiator is an estimator
+        initiated = concatenated.copy()
+        metrics = []
+        for col in (pbar := tqdm(concatenated.columns[concatenated.isna().any()], desc='Initiate values')):
+            # fit initiator
+            nan_cols = concatenated[col].isna()
+            X_train = concatenated[~nan_cols].drop(col, axis=1)
+            y_train = concatenated.loc[~nan_cols, col]
+            initiator.fit(X_train, y_train)
+            # calc initiator metric
+            train_pred = initiator.predict(X_train)
+            metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))
+            # predict init values
+            X_test = concatenated[nan_cols].drop(col, axis=1)
+            initiated.loc[nan_cols, col] = initiator.predict(X_test)
+            pbar.set_postfix({'avg. score': np.mean(metrics)})
+    elif isinstance(initiator, TransformerMixin):
+        # initiator is a transformer
+        initiated = pd.DataFrame(initiator.fit_transform(concatenated), index=concatenated.index, columns=concatenated.columns)
+    else:
+        # initiator is a fixed value
+        initiated = pd.DataFrame(concatenated.fillna(initiator), index=concatenated.index, columns=concatenated.columns)
 
+    nans = concatenated[fill_columns].isna()
+    np.random.seed(seed)
+    # multiple imputation
     for n in range(epochs):
         epoch_metrics = []
-        for col in (pbar := tqdm(data.columns[nans.any()], desc=f'Epoch {n + 1} / {epochs}')):
+        for col in (pbar := tqdm(fill_columns, desc=f'Epoch {n + 1} / {epochs}')):
             # train/test split
-            X_train = data[~nans[col]].drop(col, axis=1)
-            y_train = data.loc[~nans[col], col]
-            X_test = data[nans[col]].drop(col, axis=1)
+            X_train = initiated[~nans[col]].drop(col, axis=1)
+            y_train = initiated.loc[~nans[col], col]
+            X_test = initiated[nans[col]].drop(col, axis=1)
             # fit/predict        
             estimator.set_params(random_state=np.random.randint(2**32))
             estimator.fit(X_train, y_train)
             train_pred = estimator.predict(X_train)
             epoch_metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))
             # update mising values
-            data.loc[nans[col], col] = estimator.predict(X_test)
+            initiated.loc[nans[col], col] = estimator.predict(X_test)
             pbar.set_postfix({'avg. score': np.mean(epoch_metrics)})
-    return data
+    return initiated[fill_columns]
 
 
 # ============================== Cosine similarity =============================
@@ -478,9 +457,8 @@ class CosineSimilarity:
 
 
 @deprecated("It may take a VERY long time on large data, work unstable or don't work at all.")
-@parameter.intersection.required('total')
 @parameter.initiator.required('transformer')
-def cosine_stats(train, test, initiator, *, k=None, threshold=None, backend=None, chunksize=50, subsample=1.0, seed=None):
+def cosine_stats(train, test, initiator, fill_columns, *, k=None, threshold=None, backend=None, chunksize=50, subsample=1.0, seed=None):
     # initialize missing values
     if initiator is None:
         train_init = train
@@ -493,4 +471,4 @@ def cosine_stats(train, test, initiator, *, k=None, threshold=None, backend=None
         # os.environ['MKL_NUM_THREADS'] = '1'
     csim = CosineSimilarity(train_init, test_init, seed=seed)
     stats = csim.calculate(k=k, threshold=threshold, backend=backend, chunksize=chunksize, subsample=subsample)
-    return test.fillna(stats)
+    return test[fill_columns].fillna(stats)
