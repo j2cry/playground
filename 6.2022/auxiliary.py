@@ -199,10 +199,48 @@ def calc_train_score(df, true_df, pred):
     return np.mean(metrics), overall
 
 
-def data_initialize(initiator, train, test, concat=False):
+def data_initialize(initiator, train, test, *, separately=True):
     """ Initialize missing values with given initiator """
+    if separately:
+        train_data = train
+        test_data = test
+    else:
+        train_data = pd.concat([train, test], axis=0).drop_duplicates()
+        test_data = train_data
 
-    pass
+    # initialize missing values    
+    if hasattr(initiator, 'predict'):
+        # initiator is an estimator
+        train_init = train_data.copy()
+        test_init = test_data.copy()
+        metrics = []
+        for col in (pbar := tqdm(train_data.columns[train_data.isna().any()], desc='Initiate values')):
+            # fit initiator
+            train_nan_rows = train_data[col].isna()
+            X_train = train_data[~train_nan_rows].drop(col, axis=1)
+            y_train = train_data.loc[~train_nan_rows, col]
+            initiator.fit(X_train, y_train)
+            # calc initiator metric
+            train_pred = initiator.predict(X_train)
+            metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))
+            nan_X_train = train_init[train_nan_rows].drop(col, axis=1)
+            train_init.loc[train_nan_rows, col] = initiator.predict(nan_X_train)
+
+            # predict init values
+            test_nan_rows = test_data[col].isna()
+            X_test = test_data[test_nan_rows].drop(col, axis=1)
+            test_init.loc[test_nan_rows, col] = initiator.predict(X_test)
+            pbar.set_postfix({'avg. score': np.mean(metrics)})
+    elif isinstance(initiator, TransformerMixin):
+        # initiator is a transformer
+        train_init = pd.DataFrame(initiator.fit_transform(train_data), index=train_data.index, columns=train_data.columns)
+        test_init = pd.DataFrame(initiator.transform(test_data), index=test_data.index, columns=test_data.columns)
+    else:
+        # initiator is a fixed value
+        train_init = pd.DataFrame(train_data.fillna(initiator), index=train_data.index, columns=train_data.columns)
+        test_init = pd.DataFrame(test_data.fillna(initiator), index=test_data.index, columns=test_data.columns)
+    # return initiated data and optionally concatenated data
+    return (train_init, test_init) if separately else (train_init, train_data)
 
 # =========================== Imputer step functions ===========================
 @parameter.initiator.required('transformer')
@@ -226,7 +264,7 @@ def groupstat(train, test, initiator, fill_columns, *, gcol, func='mean'):
     return pred
 
 
-@parameter.initiator.allowed('transformer')
+@parameter.initiator.allowed('any')
 def predictor(train, test, initiator, fill_columns, *, estimator, neural=False, **fit_params):
     """ Impute data with one-per-column estimators """
     # initialize missing values
@@ -234,8 +272,7 @@ def predictor(train, test, initiator, fill_columns, *, estimator, neural=False, 
         train_init = train
         test_init = test
     else:
-        train_init = pd.DataFrame(initiator.fit_transform(train), index=train.index, columns=train.columns)
-        test_init = pd.DataFrame(initiator.transform(test), index=test.index, columns=test.columns)
+        train_init, test_init = data_initialize(initiator, train, test)
 
     pred = test.copy()
     metrics = []
@@ -262,7 +299,7 @@ def predictor(train, test, initiator, fill_columns, *, estimator, neural=False, 
     return pred
 
 
-@parameter.initiator.allowed('transformer')
+@parameter.initiator.allowed('any')
 def onestep_neural(train, test, initiator, fill_columns, *, model, **fit_params):
     """ Impute data with neural network with multidimensional output
     To one-per-column approach use predictor(..., neural=True)
@@ -272,8 +309,7 @@ def onestep_neural(train, test, initiator, fill_columns, *, model, **fit_params)
         train_init = train
         test_init = test
     else:
-        train_init = pd.DataFrame(initiator.fit_transform(train), index=train.index, columns=train.columns)
-        test_init = pd.DataFrame(initiator.transform(test), index=test.index, columns=test.columns)
+        train_init, test_init = data_initialize(initiator, train, test)
 
     pred = test.copy()
     nans = train[fill_columns].isna().any(axis=1)
@@ -302,32 +338,11 @@ def mean_matching(train, test, initiator, fill_columns, *, N, backend=None):
     :param N - number of nearest values to use in statistic calculation
     :param backend - parallel backend (for more information see sklearn docs)
     """
-    if hasattr(initiator, 'predict'):
-        # initiator is an estimator
-        initiated = test.copy()
-        metrics = []
-        for col in (pbar := tqdm(train.columns[train.isna().any()], desc='Initiate values')):
-            # fit initiator
-            X_train = train[~train[col].isna()].drop(col, axis=1)
-            y_train = train.loc[~train[col].isna(), col]            
-            initiator.fit(X_train, y_train)
-            # calc initiator metric
-            train_pred = initiator.predict(X_train)
-            metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))
-            # predict init values
-            X_test = test[test[col].isna()].drop(col, axis=1)
-            initiated.loc[test[col].isna(), col] = initiator.predict(X_test)
-            pbar.set_postfix({'avg. score': np.mean(metrics)})
-    elif isinstance(initiator, TransformerMixin):
-        # initiator is a transformer
-        initiated = pd.DataFrame(initiator.fit(train).transform(test), index=test.index, columns=test.columns)
-    else:
-        # initiator is a fixed value
-        initiated = pd.DataFrame(test.fillna(initiator), index=test.index, columns=test.columns)
+    _, test_init = data_initialize(initiator, train, test)
 
     # collect unique values in each fill_column
     fill_nan = test[fill_columns].isna()
-    uniques = initiated[fill_columns].apply(lambda col: col[fill_nan[col.name]].unique())
+    uniques = test_init[fill_columns].apply(lambda col: col[fill_nan[col.name]].unique())
 
     def get_remapper(col_name):
         unique = uniques[col_name]
@@ -347,7 +362,7 @@ def mean_matching(train, test, initiator, fill_columns, *, N, backend=None):
     else:
         remapper = {col: get_remapper(col) for col in tqdm(fill_columns, desc='Collect remapper')}
     # fill in
-    return initiated[fill_columns].apply(lambda col: col.map(remapper[col.name], na_action='ignore')).fillna(initiated[fill_columns])
+    return test_init[fill_columns].apply(lambda col: col.map(remapper[col.name], na_action='ignore')).fillna(test_init[fill_columns])
     # return initiated[nans].replace(remapper).fillna(initiated)
 
 
@@ -361,33 +376,8 @@ def mice(train, test, initiator, fill_columns, *, estimator, epochs=5, seed=None
     :param estimator - estimetor used for imputation
     :param epochs - number of iterations
     :param seed - random seed to achieve repeatability
-    """    
-    # concat train and test
-    concatenated = pd.concat([train, test], axis=0).drop_duplicates()
-    # initialize missing values
-    if hasattr(initiator, 'predict'):
-        # initiator is an estimator
-        initiated = concatenated.copy()
-        metrics = []
-        for col in (pbar := tqdm(concatenated.columns[concatenated.isna().any()], desc='Initiate values')):
-            # fit initiator
-            nan_cols = concatenated[col].isna()
-            X_train = concatenated[~nan_cols].drop(col, axis=1)
-            y_train = concatenated.loc[~nan_cols, col]
-            initiator.fit(X_train, y_train)
-            # calc initiator metric
-            train_pred = initiator.predict(X_train)
-            metrics.append(np.sqrt(mean_squared_error(y_train, train_pred)))
-            # predict init values
-            X_test = concatenated[nan_cols].drop(col, axis=1)
-            initiated.loc[nan_cols, col] = initiator.predict(X_test)
-            pbar.set_postfix({'avg. score': np.mean(metrics)})
-    elif isinstance(initiator, TransformerMixin):
-        # initiator is a transformer
-        initiated = pd.DataFrame(initiator.fit_transform(concatenated), index=concatenated.index, columns=concatenated.columns)
-    else:
-        # initiator is a fixed value
-        initiated = pd.DataFrame(concatenated.fillna(initiator), index=concatenated.index, columns=concatenated.columns)
+    """
+    initiated, concatenated = data_initialize(initiator, train, test, separately=False)
 
     nans = concatenated[fill_columns].isna()
     np.random.seed(seed)
