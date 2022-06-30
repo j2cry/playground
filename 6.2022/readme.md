@@ -10,6 +10,7 @@ Submissions are scored on the root mean squared error.
 # Notebooks description
 `overview.ipynb` - simple EDA<br>
 `baseline.ipynb` - baseline solution<br>
-`groupstat.ipynb` - fill subsets separately with different approaches<br>
+`research.ipynb` - testing different approaches<br>
+`submit.ipynb` - final calculations<br>
 
 `submission.csv` - last submitted predictions<br>
