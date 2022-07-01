@@ -1,4 +1,5 @@
 /venv/
-data/
+**/data
+**/dev.ipynb
 __pycache__
 TODO.txt
