@@ -14,17 +14,19 @@ class WithSelected:
         self.fields = fields
         self.suffix = suffix
         self.__steps = None
-    
+
     def __call__(self, *steps):
         self.__steps = steps
         return self
-    
+
     def fit(self, X, y=None):
+        if callable(self.fields):
+            self.fields = self.fields(X.columns)
         self.fields = X.columns[X.columns.isin(self.fields)] if self.fields is not None else X.columns
         for step in self.__steps:
             step.fit(X[self.fields], y)
         return self
-    
+
     def transform(self, X, **fit_params):
         X = X.copy()
         for step in self.__steps:
@@ -38,21 +40,15 @@ class WithSelected:
         return X
 
 
-class DFPowerTransform(pre.PowerTransformer):
-    def transform(self, X):
-        return pd.DataFrame(super().transform(X), index=X.index, columns=X.columns)
-
-    def fit_transform(self, X, y=None):
-        return pd.DataFrame(super().fit_transform(X, y), index=X.index, columns=X.columns)
-
-
 class Select(BaseEstimator, TransformerMixin):
     def __init__(self, fields, mode='keep'):
         assert mode in ('drop', 'keep'), "Given mode is not supported. Must be 'drop' or 'keep'"
         self.fields = fields
         self.mode = mode
-    
+
     def fit(self, X, y=None):
+        if callable(self.fields):
+            self.fields = self.fields(X.columns)
         return self
 
     def transform(self, X):
@@ -69,7 +65,7 @@ class Apply(BaseEstimator, TransformerMixin):
         assert to, "Target feature name must be set"
         self.to = to
         self.as_proba = as_proba
-    
+
     def fit(self, X, y=None):
         if self.on is None:
             self.on = X.columns
@@ -78,7 +74,7 @@ class Apply(BaseEstimator, TransformerMixin):
         tf = self.locpipe.fit_transform(X[self.on], y) if self.locpipe is not None else X[self.on]
         self.estimator.fit(tf, y)
         return self
-    
+
     def transform(self, X):
         X = X.copy()
         tf = self.locpipe.transform(X[self.on]) if self.locpipe is not None else X[self.on]
@@ -98,19 +94,33 @@ class Calc(BaseEstimator, TransformerMixin):
         self.expr = expr
         self._expr = None
         self.to = to
-    
+
     def fit(self, X, y=None):
         fields = re.findall('\w+', self.expr)
         self._expr = self.expr
+        replaced = []
         for f in fields:
-            if f in X.columns:
+            if f in X.columns and f not in replaced:
                 self._expr = self._expr.replace(f, f'X["{f}"]')
+                replaced.append(f)
         return self
-    
+
     def transform(self, X):
         X = X.copy()
         X[self.to] = eval(self._expr)
         return X
+
+
+class TypeRecast(BaseEstimator, TransformerMixin):
+    def __init__(self, **mapping):
+        self.mapping = mapping
+    
+    def fit(self, X, y=None):
+        self.mapping = {col: t for t, f in self.mapping.items() for col in (f(X.columns) if callable(f) else f)}
+        return self
+
+    def transform(self, X):
+        return X.astype(self.mapping)
 
 
 def boruta(X, y, estimator, iterations=20, alpha=0.05, seed=None, plot=False):
@@ -127,17 +137,9 @@ def boruta(X, y, estimator, iterations=20, alpha=0.05, seed=None, plot=False):
         imp_shadow = estimator.feature_importances_[X.columns.size:]
         # calc hits
         hits += imp_origin > imp_shadow.max()
-    if plot:
-        # calc proba mass function for binomial distribution
-        pmf = [sp.stats.binom.pmf(x, iterations, .5) for x in range(iterations + 1)]
-        pos = [sp.stats.binom.pmf(val, iterations, .5) for val in hits]
-        # visualize
-        fig = plt.figure(figsize=(12, 4))
-        plt.plot(range(len(pmf)), pmf)
-        sc = plt.scatter(hits, pos, c=range(X.columns.size),)
-        handles, _ = sc.legend_elements()
-        plt.legend(handles, X.columns)
-        plt.show()
     # calc
-    sf = np.array([sp.stats.binom.sf(val, iterations, .5) for val in hits])
-    return pd.DataFrame(zip(X.columns, sf, sf < alpha), columns=['feature', 'sf', 'keep']).sort_values('sf')
+    importances = pd.Series([sp.stats.binom.cdf(val, iterations, .5) for val in hits], index=X.columns)
+    if plot:
+        importances[importances > (1 - alpha)].sort_values().plot(kind='barh', title=f'Boruta ft importances for {estimator.__class__.__name__}', color='goldenrod');
+    return importances
+
