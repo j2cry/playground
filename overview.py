@@ -5,12 +5,14 @@
 
 import enum
 import pandas as pd
+import scipy.stats as stats
 from matplotlib.axes import Axes
 
 
 class FigureType(enum.IntEnum):
     HIST = enum.auto()
     BAR = enum.auto()
+    DENSITY = enum.auto()
 
 
 class StatisticLine(enum.IntFlag):
@@ -36,11 +38,17 @@ def feature_overview(ax: Axes,
     rotation = kw.pop('r', 0)
     match ftype:
         case FigureType.HIST:
-            ax.hist(feature, **kw)
+            container = ax.hist(feature, **kw)
+            if kw.get('density'):
+                density = stats.gaussian_kde(feature)
+                ax.plot(container[1], density(container[1]), c=kw.get('color'))
         case FigureType.BAR:
-            counts = feature.value_counts()
-            ax.bar(counts.index, counts, **kw)
-            ax.set_xticks(counts.index, counts.index, rotation=rotation)
+            ax.bar(feature.index, feature, **kw)
+            ax.set_xticks(feature.index, feature.index, rotation=rotation)
+        case FigureType.DENSITY:
+            density = stats.gaussian_kde(feature)
+            _, xrange = pd.cut(feature, bins=kw.pop('bins', 10), retbins=True)
+            ax.plot(xrange, density(xrange), **kw)
     # plot statistic lines
     if statline:
         if StatisticLine.ZERO in statline:
