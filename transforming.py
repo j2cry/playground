@@ -192,23 +192,24 @@ class Calc(TransformerMixin):
     """Calculate new feature from existing"""
     def __init__(self, expr: str | Callable, to: str):
         self.expr = expr
-        self._expr = ''
         self.to = to
+        self.trained = False
 
     def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> Self:
-        if not callable(self.expr):
-            fields = re.findall(r'\w+', self.expr)
-            self._expr = self.expr
-            replaced = []
-            for f in fields:
-                if f in X.columns and f not in replaced:
-                    self._expr = self._expr.replace(f, f'X["{f}"]')
-                    replaced.append(f)
+        if not callable(self.expr) and not self.trained:
+            _expr = self.expr
+            for name in set(re.findall(r'\b\w+\b', self.expr)):
+                if name not in X.columns:
+                    continue
+                pattern = rf'\b{name}\b'
+                _expr = re.sub(pattern, f'X["{name}"]', _expr)
+            self.expr = _expr
+            self.trained = True
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         X = X.copy()
-        X[self.to] = X.apply(self.expr, axis=1) if callable(self.expr) else eval(self._expr)
+        X[self.to] = X.apply(self.expr, axis=1) if callable(self.expr) else eval(self.expr)
         return X
 
 

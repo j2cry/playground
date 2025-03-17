@@ -89,15 +89,18 @@ class EnsembleMeta[**P, R](type):
         return instance
 
     @staticmethod
-    def _fit[T: EnsembleEstimator](instance: T, X, y, **fit_params) -> T:
-        for model in tqdm(instance.models):
+    def _fit[T: EnsembleEstimator](instance: T, X, y, verbose=False, **fit_params) -> T:
+        _models = tqdm(instance.models) if verbose else instance.models
+        for model in _models:
             model.fit(X, y, **fit_params)
         return instance
 
     @staticmethod
-    def _predict_proba(instance, X):
-        return np.mean([model.predict_proba(X) for model in tqdm(instance.models)], axis=0)
+    def _predict_proba(instance, X, verbose: bool = False):
+        _models = tqdm(instance.models) if verbose else instance.models
+        return np.mean([model.predict_proba(X) for model in _models], axis=0)
 
     @staticmethod
-    def _predict(instance, X):
-        return np.mean([model.predict(X) for model in tqdm(instance.models)], axis=0)
+    def _predict(instance, X, verbose: bool = False):
+        _models = tqdm(instance.models) if verbose else instance.models
+        return np.mean([model.predict(X) for model in _models], axis=0)
