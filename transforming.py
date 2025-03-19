@@ -12,6 +12,7 @@ from typing import (
     Literal,
     Mapping,
     Self,
+    Sequence,
     overload
 )
 
@@ -263,7 +264,7 @@ class Group(TransformerMixin):
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         X = X.copy()
         if self._statistics is not None:
-            return X.merge(self._statistics)
+            return X.merge(self._statistics, how='left')
         return X
 
 
@@ -334,6 +335,39 @@ class Swap(TransformerMixin):
         temp = X.loc[condition, self.left]
         X.loc[condition, self.left] = X.loc[condition, self.right]
         X.loc[condition, self.right] = temp
+        return X
+
+
+class Bins(TransformerMixin):
+    """Make bins"""
+    def __init__(
+            self,
+            on: str,
+            to: str,
+            bins: int | Sequence[int] | Sequence[float],
+            as_: Literal['code', 'left', 'right'] = 'code',
+    ):
+        self.on = on
+        self.to = to
+        self.bins = bins
+        self.categories = None
+        self.as_ = as_
+
+    def __get_bound(self, cat: pd.Interval):
+        return cat.left if self.as_ == 'left' else cat.right
+
+    def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> Self:
+        self.categories = pd.cut(X[self.on], bins=self.bins).cat.categories
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        assert self.categories is not None, 'Bins transformer is not trained'
+        X = X.copy()
+        values = pd.cut(X[self.on], bins=self.categories)
+        if self.as_ == 'code':
+            X[self.to] = values.cat.codes.astype(np.int64)
+        else:
+            X[self.to] = values.apply(self.__get_bound).astype(np.float64)
         return X
 
 
