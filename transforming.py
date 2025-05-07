@@ -157,7 +157,7 @@ class Apply(TransformerMixin):
             estimator: BaseEstimator,
             locpipe: TransformerMixin | None = None,
             on: Iterable[str] | None = None,
-            to: str = '',
+            to: str | Sequence[str] = '',
             as_proba: bool = False
     ):
         self.estimator = estimator
@@ -182,7 +182,7 @@ class Apply(TransformerMixin):
             X[self.to] = self.estimator.predict_proba(df).T[1]  # type: ignore
         elif hasattr(self.estimator, 'predict'):
             X[self.to] = self.estimator.predict(df)     # type: ignore
-        elif hasattr(self.estimator, 'tramsform'):
+        elif hasattr(self.estimator, 'transform'):
             X[self.to] = self.estimator.transform(df)   # type: ignore
         else:
             classname = self.estimator.__class__.__name__
