@@ -4,9 +4,13 @@
 # sys.path.append(os.path.abspath(os.pardir))
 
 import enum
+from typing import Iterable
+
 import pandas as pd
 import scipy.stats as stats
+import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
+from sklearn.cluster import KMeans
 
 
 class FigureType(enum.IntEnum):
@@ -64,3 +68,19 @@ def feature_overview(ax: Axes,
                 color = f'#{hex(255 - color_step * n)[2:]}0000'
                 ax.axvline(mode, c=color, linewidth=1, label=f'mode {n + 1}')
         ax.legend()
+
+
+def kmeans_elbow(X, range_clusters: Iterable[int], **params):
+    """Elbow method for KMeans"""
+    values = []
+    RANGE = tuple(range_clusters)
+    for k in RANGE:
+        kmeans = KMeans(k, **params)
+        kmeans.fit(X)
+        values.append(kmeans.inertia_)
+
+    fig = plt.figure(figsize=(7, 3.5))
+    fig.suptitle('Kmeans Elbow')
+    plt.plot(RANGE, values, marker='.')
+    plt.xticks(RANGE)
+    plt.show()
