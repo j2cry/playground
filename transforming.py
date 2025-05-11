@@ -347,24 +347,26 @@ class Bins(TransformerMixin):
             to: str,
             bins: int | Sequence[int] | Sequence[float],
             as_: Literal['code', 'left', 'right'] = 'code',
+            quantile: bool = False,
     ):
         self.on = on
         self.to = to
         self.bins = bins
         self.categories = None
         self.as_ = as_
+        self._cutter = pd.qcut if quantile else pd.cut
 
     def __get_bound(self, cat: pd.Interval):
         return cat.left if self.as_ == 'left' else cat.right
 
     def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> Self:
-        self.categories = pd.cut(X[self.on], bins=self.bins).cat.categories
+        self.categories = self._cutter(X[self.on], self.bins).cat.categories
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         assert self.categories is not None, 'Bins transformer is not trained'
         X = X.copy()
-        values = pd.cut(X[self.on], bins=self.categories)
+        values = pd.cut(X[self.on], self.categories)
         if self.as_ == 'code':
             X[self.to] = values.cat.codes.astype(np.int64)
         else:
