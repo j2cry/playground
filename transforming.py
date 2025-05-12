@@ -240,19 +240,21 @@ class Group(TransformerMixin):
             by: str | list[str],
             aggregation: AggFuncTypeFrame,
             prefix: str = 'agg_',
-            include_target: bool = False
+            target: Literal['exclude', 'include', 'only'] = 'exclude'
     ):
         self.by = [by] if isinstance(by, str) else by
         self.aggregation = aggregation
         self._statistics = None
         self._prefix = prefix
-        self._include_target = include_target
+        self._target = target
 
     def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> Self:
-        if y is not None and self._include_target:
+        if y is not None and self._target in ('include', 'only'):
             assert y.name not in self.by, 'Grouping by target is logically incorrect'
             X = X.copy()
             X[y.name] = y
+            if self._target == 'only':
+                X = X[[*self.by, y.name]]
         self._statistics = X.groupby(self.by, as_index=False).agg(self.aggregation)
         mapper = {
             name: f'{self._prefix}{name}'
