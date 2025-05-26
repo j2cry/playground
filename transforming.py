@@ -112,7 +112,7 @@ class WithSelected(Select):
         self._steps = ()
         self.propagate = propagate
 
-    def __call__(self, *steps: TransformerMixin) -> Self:
+    def __call__(self, *steps: TransformerMixin | Pipeline) -> Self:
         self._steps = steps
         return self
 
@@ -141,13 +141,14 @@ class WithSelected(Select):
         for step in self._steps:
             df = step.transform(df if self.propagate else X[selected], **fit_params)  # type: ignore
         # resolve column names
-        if len(selected) == 1 and not hasattr(df, 'columns'):
-            columns = [f'{selected[0]}_{n}' for n in range(df.shape[1])]
-            X[columns] = df.toarray()   # type: ignore
-        else:
+        if isinstance(df, pd.DataFrame):
             columns = [f'{self.prefix}{name}' if self.prefix and name in selected else name
                        for name in df.columns]
-            X.loc[:, columns] = df.values
+            # X.loc[:, columns] = df.values
+            X[columns] = df.values
+        else:
+            columns = [f'{self.prefix or "feature"}_{n}' for n in range(df.shape[1])]
+            X[columns] = df.toarray() if hasattr(df, 'toarray') else df     # type: ignore
         return X
 
 
@@ -295,7 +296,7 @@ class Fill(TransformerMixin):
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         assert self._statistics is not None, 'Fill block is not fit'
-        return X.fillna(self._statistics)   # type: ignore
+        return X.infer_objects(copy=False).fillna(self._statistics)   # type: ignore
 
 
 class Swap(TransformerMixin):
