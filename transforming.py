@@ -112,7 +112,7 @@ class WithSelected(Select):
         self._steps = ()
         self.propagate = propagate
 
-    def __call__(self, *steps: TransformerMixin) -> Self:
+    def __call__(self, *steps: TransformerMixin | Pipeline) -> Self:
         self._steps = steps
         return self
 
@@ -141,13 +141,14 @@ class WithSelected(Select):
         for step in self._steps:
             df = step.transform(df if self.propagate else X[selected], **fit_params)  # type: ignore
         # resolve column names
-        if len(selected) == 1 and not hasattr(df, 'columns'):
-            columns = [f'{selected[0]}_{n}' for n in range(df.shape[1])]
-            X[columns] = df.toarray()   # type: ignore
-        else:
+        if isinstance(df, pd.DataFrame):
             columns = [f'{self.prefix}{name}' if self.prefix and name in selected else name
                        for name in df.columns]
-            X.loc[:, columns] = df.values
+            # X.loc[:, columns] = df.values
+            X[columns] = df.values
+        else:
+            columns = [f'{self.prefix or "feature"}_{n}' for n in range(df.shape[1])]
+            X[columns] = df.toarray() if hasattr(df, 'toarray') else df     # type: ignore
         return X
 
 
@@ -157,7 +158,7 @@ class Apply(TransformerMixin):
             estimator: BaseEstimator,
             locpipe: TransformerMixin | None = None,
             on: Iterable[str] | None = None,
-            to: str = '',
+            to: str | Sequence[str] = '',
             as_proba: bool = False
     ):
         self.estimator = estimator
@@ -182,7 +183,7 @@ class Apply(TransformerMixin):
             X[self.to] = self.estimator.predict_proba(df).T[1]  # type: ignore
         elif hasattr(self.estimator, 'predict'):
             X[self.to] = self.estimator.predict(df)     # type: ignore
-        elif hasattr(self.estimator, 'tramsform'):
+        elif hasattr(self.estimator, 'transform'):
             X[self.to] = self.estimator.transform(df)   # type: ignore
         else:
             classname = self.estimator.__class__.__name__
@@ -240,19 +241,21 @@ class Group(TransformerMixin):
             by: str | list[str],
             aggregation: AggFuncTypeFrame,
             prefix: str = 'agg_',
-            include_target: bool = False
+            target: Literal['exclude', 'include', 'only'] = 'exclude'
     ):
         self.by = [by] if isinstance(by, str) else by
         self.aggregation = aggregation
         self._statistics = None
         self._prefix = prefix
-        self._include_target = include_target
+        self._target = target
 
     def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> Self:
-        if y is not None and self._include_target:
+        if y is not None and self._target in ('include', 'only'):
             assert y.name not in self.by, 'Grouping by target is logically incorrect'
             X = X.copy()
             X[y.name] = y
+            if self._target == 'only':
+                X = X[[*self.by, y.name]]
         self._statistics = X.groupby(self.by, as_index=False).agg(self.aggregation)
         mapper = {
             name: f'{self._prefix}{name}'
@@ -293,7 +296,7 @@ class Fill(TransformerMixin):
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         assert self._statistics is not None, 'Fill block is not fit'
-        return X.fillna(self._statistics)   # type: ignore
+        return X.infer_objects(copy=False).fillna(self._statistics)   # type: ignore
 
 
 class Swap(TransformerMixin):
@@ -347,24 +350,26 @@ class Bins(TransformerMixin):
             to: str,
             bins: int | Sequence[int] | Sequence[float],
             as_: Literal['code', 'left', 'right'] = 'code',
+            quantile: bool = False,
     ):
         self.on = on
         self.to = to
         self.bins = bins
         self.categories = None
         self.as_ = as_
+        self._cutter = pd.qcut if quantile else pd.cut
 
     def __get_bound(self, cat: pd.Interval):
         return cat.left if self.as_ == 'left' else cat.right
 
     def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> Self:
-        self.categories = pd.cut(X[self.on], bins=self.bins).cat.categories
+        self.categories = self._cutter(X[self.on], self.bins).cat.categories
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         assert self.categories is not None, 'Bins transformer is not trained'
         X = X.copy()
-        values = pd.cut(X[self.on], bins=self.categories)
+        values = pd.cut(X[self.on], self.categories)
         if self.as_ == 'code':
             X[self.to] = values.cat.codes.astype(np.int64)
         else:
